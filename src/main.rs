@@ -44,31 +44,38 @@ enum InputMode {
 enum JumpAction {
     MarkRead { key: String },
     HideDeck,
+    FocusTerminalPane { pane_id: u32 },
     SwitchSession { session: String, pane_id: u32 },
 }
 
-fn jump_plan(agent: &AgentRecord) -> Result<Vec<JumpAction>, &'static str> {
+fn jump_plan(current_session: &str, agent: &AgentRecord) -> Result<Vec<JumpAction>, &'static str> {
     let pane_id = agent
         .pane_id
         .ok_or("This agent no longer has a live pane; press R to resume it")?;
     if agent.zellij_session.is_empty() {
         return Err("This agent no longer has a live pane; press R to resume it");
     }
+    let navigate = if agent.zellij_session == current_session {
+        JumpAction::FocusTerminalPane { pane_id }
+    } else {
+        JumpAction::SwitchSession {
+            session: agent.zellij_session.clone(),
+            pane_id,
+        }
+    };
     Ok(vec![
         JumpAction::MarkRead {
             key: agent.key.clone(),
         },
         JumpAction::HideDeck,
-        JumpAction::SwitchSession {
-            session: agent.zellij_session.clone(),
-            pane_id,
-        },
+        navigate,
     ])
 }
 
 #[derive(Default)]
 struct AgentDeck {
     helper: String,
+    current_session: String,
     agents: Vec<AgentRecord>,
     selected: usize,
     filter: usize,
@@ -78,6 +85,8 @@ struct AgentDeck {
     notice: String,
     visible: bool,
     refresh_ticks: u8,
+    next_list_request: u64,
+    applied_list_request: u64,
 }
 
 const FILTERS: [&str; 6] = ["all", "unread", "running", "waiting", "done", "parked"];
@@ -88,18 +97,25 @@ impl AgentDeck {
     }
 
     fn run_helper(&self, operation: &str, args: &[String]) {
+        self.run_helper_with_context(args, Self::context(operation));
+    }
+
+    fn run_helper_with_context(&self, args: &[String], context: BTreeMap<String, String>) {
         let mut command = vec![self.helper.clone()];
         command.extend(args.iter().cloned());
         let refs = command.iter().map(String::as_str).collect::<Vec<_>>();
-        run_command(&refs, Self::context(operation));
+        run_command(&refs, context);
     }
 
-    fn refresh(&self, enrich: bool) {
+    fn refresh(&mut self, enrich: bool) {
         let mut args = vec!["list".to_owned()];
         if enrich {
             args.push("--refresh".to_owned());
         }
-        self.run_helper("list", &args);
+        self.next_list_request = self.next_list_request.wrapping_add(1);
+        let mut context = Self::context("list");
+        context.insert("request_id".into(), self.next_list_request.to_string());
+        self.run_helper_with_context(&args, context);
     }
 
     fn matches_filter(&self, agent: &AgentRecord) -> bool {
@@ -185,7 +201,7 @@ impl AgentDeck {
 
     fn jump_selected(&mut self) {
         if let Some(agent) = self.selected_agent() {
-            match jump_plan(&agent) {
+            match jump_plan(&self.current_session, &agent) {
                 Ok(actions) => {
                     for action in actions {
                         match action {
@@ -193,6 +209,9 @@ impl AgentDeck {
                                 self.run_helper("mark-read", &["mark-read".into(), key]);
                             }
                             JumpAction::HideDeck => hide_self(),
+                            JumpAction::FocusTerminalPane { pane_id } => {
+                                focus_terminal_pane(pane_id, false, false);
+                            }
                             JumpAction::SwitchSession { session, pane_id } => {
                                 switch_session_with_focus(&session, None, Some((pane_id, false)));
                             }
@@ -205,6 +224,16 @@ impl AgentDeck {
     }
 
     fn apply_agent_signal(&mut self, agent: AgentRecord) {
+        if let Some(existing) = self
+            .agents
+            .iter_mut()
+            .find(|existing| existing.key == agent.key)
+        {
+            *existing = agent.clone();
+        } else {
+            self.agents.push(agent.clone());
+        }
+        self.clamp_selection();
         if let Some(pane_id) = agent.pane_id {
             let pane = PaneId::Terminal(pane_id);
             let wants_attention =
@@ -218,6 +247,7 @@ impl AgentDeck {
             rename_terminal_pane(pane_id, label);
         }
         self.refresh(false);
+        self.applied_list_request = self.next_list_request;
     }
 
     fn submit_input(&mut self) {
@@ -341,8 +371,16 @@ impl AgentDeck {
     ) {
         let operation = context.get("operation").map(String::as_str).unwrap_or("");
         if operation == "list" && code.unwrap_or(1) == 0 {
+            let request_id = context
+                .get("request_id")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            if request_id < self.applied_list_request {
+                return;
+            }
             match serde_json::from_slice::<Vec<AgentRecord>>(&stdout) {
                 Ok(agents) => {
+                    self.applied_list_request = request_id;
                     self.agents = agents;
                     self.clamp_selection();
                     if self.notice.starts_with("Refreshing") {
@@ -369,6 +407,9 @@ impl ZellijPlugin for AgentDeck {
             .get("helper")
             .cloned()
             .unwrap_or_else(|| "zellij-agent-deck".into());
+        self.current_session = get_session_environment_variables()
+            .remove("ZELLIJ_SESSION_NAME")
+            .unwrap_or_default();
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
@@ -419,7 +460,8 @@ impl ZellijPlugin for AgentDeck {
                 set_timeout(3.0);
             }
             Event::RunCommandResult(code, stdout, stderr, context) => {
-                self.handle_result(code, stdout, stderr, context)
+                self.handle_result(code, stdout, stderr, context);
+                return true;
             }
             Event::PermissionRequestResult(PermissionStatus::Denied) => {
                 self.notice = "Agent Deck permissions were denied".into();
@@ -434,6 +476,7 @@ impl ZellijPlugin for AgentDeck {
             if let Some(payload) = pipe_message.payload {
                 if let Ok(agent) = serde_json::from_str::<AgentRecord>(&payload) {
                     self.apply_agent_signal(agent);
+                    return true;
                 }
             }
         } else if pipe_message.name == "toggle" {
@@ -634,6 +677,81 @@ mod tests {
     }
 
     #[test]
+    fn completed_dismiss_requests_redraw_when_visibility_event_was_missed() {
+        let mut deck = AgentDeck::default();
+        let context = AgentDeck::context("dismiss");
+
+        assert!(deck.update(Event::RunCommandResult(
+            Some(0),
+            Vec::new(),
+            Vec::new(),
+            context,
+        )));
+    }
+
+    #[test]
+    fn new_agent_event_requests_redraw_when_visibility_event_was_missed() {
+        let mut deck = AgentDeck::default();
+        let payload = serde_json::to_string(&AgentRecord {
+            key: "codex:new".into(),
+            project: "example".into(),
+            title: "new task".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let message = PipeMessage::new(
+            PipeSource::Cli("test".into()),
+            "agent-event",
+            &Some(payload),
+            &None,
+            false,
+        );
+
+        assert!(deck.pipe(message));
+        assert_eq!(deck.agents.len(), 1);
+    }
+
+    #[test]
+    fn jump_within_current_session_focuses_the_terminal_pane() {
+        let agent = AgentRecord {
+            key: "codex:example".into(),
+            zellij_session: "work".into(),
+            pane_id: Some(7),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            jump_plan("work", &agent),
+            Ok(vec![
+                JumpAction::MarkRead {
+                    key: "codex:example".into(),
+                },
+                JumpAction::HideDeck,
+                JumpAction::FocusTerminalPane { pane_id: 7 },
+            ])
+        );
+    }
+
+    #[test]
+    fn stale_list_result_cannot_restore_a_dismissed_agent() {
+        let mut deck = AgentDeck::default();
+        let mut latest = AgentDeck::context("list");
+        latest.insert("request_id".into(), "2".into());
+        let mut stale = AgentDeck::context("list");
+        stale.insert("request_id".into(), "1".into());
+        let dismissed = serde_json::to_vec(&vec![AgentRecord {
+            key: "codex:dismissed".into(),
+            ..Default::default()
+        }])
+        .unwrap();
+
+        deck.handle_result(Some(0), b"[]".to_vec(), Vec::new(), latest);
+        deck.handle_result(Some(0), dismissed, Vec::new(), stale);
+
+        assert!(deck.agents.is_empty());
+    }
+
+    #[test]
     fn jump_hides_deck_before_switching_to_terminal_pane() {
         let agent = AgentRecord {
             key: "codex:example".into(),
@@ -643,7 +761,7 @@ mod tests {
         };
 
         assert_eq!(
-            jump_plan(&agent),
+            jump_plan("deck", &agent),
             Ok(vec![
                 JumpAction::MarkRead {
                     key: "codex:example".into(),
