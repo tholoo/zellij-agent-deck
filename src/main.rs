@@ -84,6 +84,7 @@ struct AgentDeck {
     staged: String,
     notice: String,
     visible: bool,
+    permissions_granted: bool,
     refresh_ticks: u8,
     next_list_request: u64,
     applied_list_request: u64,
@@ -92,6 +93,15 @@ struct AgentDeck {
 const FILTERS: [&str; 6] = ["all", "unread", "running", "waiting", "done", "parked"];
 
 impl AgentDeck {
+    fn required_permissions() -> [PermissionType; 4] {
+        [
+            PermissionType::ReadApplicationState,
+            PermissionType::ChangeApplicationState,
+            PermissionType::RunCommands,
+            PermissionType::ReadSessionEnvironmentVariables,
+        ]
+    }
+
     fn context(operation: &str) -> BTreeMap<String, String> {
         BTreeMap::from([("operation".to_owned(), operation.to_owned())])
     }
@@ -101,6 +111,9 @@ impl AgentDeck {
     }
 
     fn run_helper_with_context(&self, args: &[String], context: BTreeMap<String, String>) {
+        if !self.permissions_granted {
+            return;
+        }
         let mut command = vec![self.helper.clone()];
         command.extend(args.iter().cloned());
         let refs = command.iter().map(String::as_str).collect::<Vec<_>>();
@@ -108,6 +121,9 @@ impl AgentDeck {
     }
 
     fn refresh(&mut self, enrich: bool) {
+        if !self.permissions_granted {
+            return;
+        }
         let mut args = vec!["list".to_owned()];
         if enrich {
             args.push("--refresh".to_owned());
@@ -234,6 +250,14 @@ impl AgentDeck {
             self.agents.push(agent.clone());
         }
         self.clamp_selection();
+        if self.permissions_granted {
+            self.sync_agent_pane(&agent);
+            self.refresh(false);
+            self.applied_list_request = self.next_list_request;
+        }
+    }
+
+    fn sync_agent_pane(&self, agent: &AgentRecord) {
         if let Some(pane_id) = agent.pane_id {
             let pane = PaneId::Terminal(pane_id);
             let wants_attention =
@@ -246,8 +270,19 @@ impl AgentDeck {
             let label = truncate(&format!("{}: {}", agent.project, agent.title), 80);
             rename_terminal_pane(pane_id, label);
         }
+    }
+
+    fn activate_after_permissions_granted(&mut self) {
+        self.permissions_granted = true;
+        self.current_session = get_session_environment_variables()
+            .remove("ZELLIJ_SESSION_NAME")
+            .unwrap_or_default();
+        for agent in &self.agents {
+            self.sync_agent_pane(agent);
+        }
+        set_timeout(3.0);
         self.refresh(false);
-        self.applied_list_request = self.next_list_request;
+        hide_self();
     }
 
     fn submit_input(&mut self) {
@@ -407,14 +442,6 @@ impl ZellijPlugin for AgentDeck {
             .get("helper")
             .cloned()
             .unwrap_or_else(|| "zellij-agent-deck".into());
-        self.current_session = get_session_environment_variables()
-            .remove("ZELLIJ_SESSION_NAME")
-            .unwrap_or_default();
-        request_permission(&[
-            PermissionType::ReadApplicationState,
-            PermissionType::ChangeApplicationState,
-            PermissionType::RunCommands,
-        ]);
         subscribe(&[
             EventType::Key,
             EventType::Mouse,
@@ -424,9 +451,7 @@ impl ZellijPlugin for AgentDeck {
             EventType::PermissionRequestResult,
         ]);
         set_selectable(true);
-        set_timeout(3.0);
-        self.refresh(false);
-        hide_self();
+        request_permission(&Self::required_permissions());
     }
 
     fn update(&mut self, event: Event) -> bool {
@@ -464,7 +489,11 @@ impl ZellijPlugin for AgentDeck {
                 return true;
             }
             Event::PermissionRequestResult(PermissionStatus::Denied) => {
+                self.permissions_granted = false;
                 self.notice = "Agent Deck permissions were denied".into();
+            }
+            Event::PermissionRequestResult(PermissionStatus::Granted) => {
+                self.activate_after_permissions_granted();
             }
             _ => return false,
         }
@@ -656,6 +685,13 @@ mod tests {
     // the test binary can link outside the WASM host.
     #[no_mangle]
     extern "C" fn host_run_plugin_command() {}
+
+    #[test]
+    fn startup_requires_session_environment_permission() {
+        assert!(AgentDeck::required_permissions()
+            .contains(&PermissionType::ReadSessionEnvironmentVariables));
+        assert!(!AgentDeck::default().permissions_granted);
+    }
 
     #[test]
     fn truncates_on_character_boundaries() {

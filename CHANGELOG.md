@@ -12,6 +12,8 @@ is based on Keep a Changelog, and the project follows Semantic Versioning.
 ### Fixed
 
 - Hide the floating deck before jumping to a selected Codex pane.
+- Request session-environment access before reading the Zellij session name,
+  preventing a permission denial from trapping the plugin during startup.
 
 ## [0.1.0] - Unreleased
 
