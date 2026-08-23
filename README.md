@@ -9,6 +9,10 @@ demand.
 > This project is an independent integration for Codex and Zellij. It is not
 > affiliated with or endorsed by OpenAI or the Zellij project.
 
+![Synthetic Zellij Agent Deck demo showing fictional agent sessions](docs/assets/agent-deck-demo.png)
+
+_Synthetic demo with fictional sessions and task data._
+
 ## Requirements
 
 - Linux

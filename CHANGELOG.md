@@ -5,6 +5,10 @@ is based on Keep a Changelog, and the project follows Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- Synthetic Agent Deck screenshot for the project documentation.
+
 ### Fixed
 
 - Hide the floating deck before jumping to a selected Codex pane.
