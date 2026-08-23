@@ -1,0 +1,29 @@
+# Build outputs
+/result
+/target
+
+# Python caches and environments
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Test and coverage artifacts
+.coverage
+coverage.xml
+htmlcov/
+
+# Local tooling and editor state
+.direnv/
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+*.swp
+*~
+
+# Secret-scanner output
+gitleaks-report.*

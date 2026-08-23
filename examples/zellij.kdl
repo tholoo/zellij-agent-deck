@@ -1,0 +1,22 @@
+plugins {
+    agent-deck location="file:~/.nix-profile/share/zellij/plugins/agent-deck.wasm" {
+        helper "zellij-agent-deck"
+    }
+}
+
+// Keep one hidden instance in each session so lifecycle events are received.
+load_plugins {
+    agent-deck
+}
+
+keybinds {
+    shared_except "locked" {
+        bind "Alt a" {
+            LaunchOrFocusPlugin "agent-deck" {
+                floating true
+                move_to_focused_tab true
+            }
+            SwitchToMode "Normal"
+        }
+    }
+}

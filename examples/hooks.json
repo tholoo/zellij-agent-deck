@@ -1,0 +1,104 @@
+{
+  "description": "Send Codex lifecycle status to Zellij Agent Deck.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "zellij-agent-deck hook",
+            "timeout": 4
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "zellij-agent-deck hook",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "zellij-agent-deck hook",
+            "timeout": 4
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "zellij-agent-deck hook",
+            "timeout": 4
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "zellij-agent-deck hook",
+            "timeout": 4
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "zellij-agent-deck hook",
+            "timeout": 4
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "zellij-agent-deck hook",
+            "timeout": 4
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "zellij-agent-deck hook",
+            "timeout": 4
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "zellij-agent-deck hook",
+            "timeout": 4
+          }
+        ]
+      }
+    ]
+  }
+}

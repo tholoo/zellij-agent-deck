@@ -1,0 +1,74 @@
+minimum_pre_commit_version: "4.0.0"
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-added-large-files
+        args: ["--maxkb=1024"]
+      - id: check-case-conflict
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-toml
+      - id: check-yaml
+      - id: detect-private-key
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+        args: ["--fix=lf"]
+      - id: trailing-whitespace
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.15
+    hooks:
+      - id: ruff-check
+        args: ["--fix"]
+      - id: ruff-format
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.27.0
+    hooks:
+      - id: gitleaks-system
+        pass_filenames: false
+
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy
+        entry: mypy agent_deck.py
+        language: system
+        pass_filenames: false
+        types: [python]
+
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all -- --check
+        language: system
+        pass_filenames: false
+        types_or: [rust, toml]
+
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --all-targets --all-features -- -D warnings
+        language: system
+        pass_filenames: false
+        types_or: [rust, toml]
+
+      - id: unit-tests
+        name: unit tests
+        entry: sh -c 'cargo test --all-targets && python3 -m unittest discover -s tests -v'
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: nixfmt
+        name: nixfmt
+        entry: nixfmt --check
+        language: system
+        types: [nix]
+
+      - id: nix-flake-check
+        name: nix flake evaluation
+        entry: nix flake check path:. --no-build
+        language: system
+        pass_filenames: false
+        types: [nix]

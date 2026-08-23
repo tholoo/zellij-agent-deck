@@ -1,0 +1,20 @@
+[package]
+name = "zellij-agent-deck"
+version = "0.1.0"
+edition = "2021"
+description = "A cross-session inbox and control surface for Codex agents in Zellij"
+license = "MIT"
+readme = "README.md"
+keywords = ["codex", "zellij", "terminal", "agents"]
+categories = ["command-line-utilities", "development-tools"]
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zellij-tile = "=0.44.3"
+
+[profile.release]
+lto = true
+opt-level = "s"
+strip = true
