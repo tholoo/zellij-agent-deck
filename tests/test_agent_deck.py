@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -90,7 +91,10 @@ class AgentDeckTest(unittest.TestCase):
         sessions = deck.subprocess.CompletedProcess([], 0, "dev [Created 1m ago] (current)\n", "")
         panes = deck.subprocess.CompletedProcess([], 0, json.dumps([]), "")
 
-        with patch.object(deck, "run", side_effect=[sessions, panes]):
+        with (
+            patch.object(deck.shutil, "which", return_value="/test/zellij"),
+            patch.object(deck, "run", side_effect=[sessions, panes]),
+        ):
             deck.reconcile_records(force=True)
 
         reconciled = deck.lookup(record["key"])
@@ -103,7 +107,10 @@ class AgentDeckTest(unittest.TestCase):
             [], 0, "dev [Created 1m ago] (EXITED - attach to resurrect)\n", ""
         )
 
-        with patch.object(deck, "run", return_value=sessions) as run:
+        with (
+            patch.object(deck.shutil, "which", return_value="/test/zellij"),
+            patch.object(deck, "run", return_value=sessions) as run,
+        ):
             deck.reconcile_records(force=True)
 
         self.assertIsNone(deck.lookup(record["key"])["pane_id"])
@@ -114,7 +121,10 @@ class AgentDeckTest(unittest.TestCase):
         sessions = deck.subprocess.CompletedProcess([], 0, "dev [Created 1m ago] (current)\n", "")
         failed_panes = deck.subprocess.CompletedProcess([], 1, "", "temporary failure")
 
-        with patch.object(deck, "run", side_effect=[sessions, failed_panes]):
+        with (
+            patch.object(deck.shutil, "which", return_value="/test/zellij"),
+            patch.object(deck, "run", side_effect=[sessions, failed_panes]),
+        ):
             deck.reconcile_records(force=True)
 
         self.assertEqual(deck.lookup(record["key"])["pane_id"], 7)
@@ -252,6 +262,35 @@ class AgentDeckTest(unittest.TestCase):
                 "start here",
             ],
         )
+
+    def test_git_timeout_degrades_to_empty_metadata(self):
+        with patch.object(deck, "run", side_effect=deck.subprocess.TimeoutExpired("git", 1.5)):
+            self.assertEqual(deck.git_output(self.temp.name, "status"), "")
+
+    def test_malformed_json_record_is_ignored(self):
+        (Path(self.temp.name) / "malformed.json").write_text("[]")
+
+        self.assertEqual(deck.records(), [])
+
+    def test_record_store_serializes_concurrent_updates(self):
+        store = deck.RecordStore(Path(self.temp.name))
+        record = self.event("SessionStart")
+        store.update(record["key"], lambda current: {**current, "counter": 0})
+
+        def increment():
+            for _ in range(40):
+                store.update(
+                    record["key"],
+                    lambda current: {**current, "counter": current.get("counter", 0) + 1},
+                )
+
+        workers = [threading.Thread(target=increment) for _ in range(5)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+
+        self.assertEqual(store.get(record["key"])["counter"], 200)
 
 
 if __name__ == "__main__":

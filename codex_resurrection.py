@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import fcntl
 import json
 import os
 import re
@@ -13,6 +14,7 @@ import sys
 import tempfile
 import time
 import uuid
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +24,7 @@ STATE_DIR_ENV = "ZELLIJ_AGENT_DECK_RESURRECTION_DIR"
 ZELLIJ_CACHE_DIR_ENV = "ZELLIJ_AGENT_DECK_ZELLIJ_CACHE_DIR"
 RETENTION_DAYS_ENV = "ZELLIJ_AGENT_DECK_RESURRECTION_RETENTION_DAYS"
 DEFAULT_RETENTION_DAYS = 7
+DEFAULT_GC_INTERVAL_SECONDS = 24 * 60 * 60
 
 TOKEN_TEXT = r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
 TOKEN = re.compile(rf"^{TOKEN_TEXT}$")
@@ -150,7 +153,48 @@ def gc_resurrections(
     return sorted(removed)
 
 
+@contextlib.contextmanager
+def gc_lock(root: Path) -> Iterator[None]:
+    path = root / ".gc.lock"
+    with path.open("a+") as stream:
+        path.chmod(0o600)
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def maybe_gc_resurrections(interval_seconds: int = DEFAULT_GC_INTERVAL_SECONDS) -> bool:
+    """Collect stale mappings at most once per interval as part of normal use."""
+    if interval_seconds < 0:
+        raise ValueError("GC interval must not be negative")
+    root = resurrection_dir(create=True)
+    marker = root / ".last-gc"
+    current_time = time.time()
+    with gc_lock(root):
+        try:
+            if current_time - marker.stat().st_mtime < interval_seconds:
+                return False
+        except OSError:
+            pass
+        marker.touch()
+        marker.chmod(0o600)
+    try:
+        gc_resurrections(retention_default(), current_time=current_time)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            marker.unlink()
+        raise
+    return True
+
+
 def supervise(real_codex: str, token: str | None, codex_args: list[str]) -> int:
+    if token is not None or os.environ.get("ZELLIJ") and not codex_args:
+        # Cleanup must never make launching Codex fail. The explicit `gc`
+        # command remains available when configuration errors need surfacing.
+        with contextlib.suppress(OSError, TypeError, ValueError):
+            maybe_gc_resurrections()
     if token is not None:
         if not valid_token(token) or codex_args:
             raise ValueError("invalid tokenized Codex supervisor command")
@@ -169,6 +213,9 @@ def supervise(real_codex: str, token: str | None, codex_args: list[str]) -> int:
         os.execv(sys.executable, command)
         return 127
     else:
+        # A nested Codex command inherits the outer supervisor environment.
+        # It must not be allowed to claim the outer pane's resurrection token.
+        os.environ.pop(TOKEN_ENV, None)
         os.execv(real_codex, [real_codex, *codex_args])
         return 127
 

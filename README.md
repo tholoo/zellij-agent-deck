@@ -5,11 +5,14 @@ lifecycle hooks send bounded status records to a background Zellij plugin. The
 plugin highlights panes that need attention and opens as a floating pane on
 demand.
 
+The project is currently pre-release; use the pinned `main` branch until the
+first versioned release is tagged.
+
 > [!IMPORTANT]
 > This project is an independent integration for Codex and Zellij. It is not
 > affiliated with or endorsed by OpenAI or the Zellij project.
 
-![Synthetic Zellij Agent Deck demo showing fictional agent sessions](docs/assets/agent-deck-demo.png)
+![Synthetic Zellij Agent Deck demo showing fictional agent sessions](docs/assets/agent-deck-demo.webp)
 
 _Synthetic demo with fictional sessions and task data._
 
@@ -36,8 +39,26 @@ For a local build:
 nix build path:.
 ```
 
-The package installs the `zellij-agent-deck` bridge and the plugin at
-`share/zellij/plugins/agent-deck.wasm`.
+The package installs both host executables, the plugin at
+`share/zellij/plugins/agent-deck.wasm`, and configuration examples under
+`share/doc/zellij-agent-deck/examples`.
+
+### Home Manager
+
+The flake exports a Home Manager module that installs the package and plugin and
+sets resurrection retention options:
+
+```nix
+{
+  imports = [ inputs.zellij-agent-deck.homeManagerModules.default ];
+  programs.zellij-agent-deck.enable = true;
+}
+```
+
+It also exports `lib.mkCodexHooks`, `lib.mkCodexRequirements`, and
+`lib.mkCodexWrapper`. These parameterized helpers let declarative configurations
+reuse the same hook topology as `examples/hooks.json` without copying
+machine-specific paths into this repository.
 
 ## Configure Zellij
 
@@ -136,13 +157,17 @@ refreshes a mapping's age. A normal Codex exit removes its mapping immediately;
 terminating the Zellij session kills the supervisor and deliberately preserves
 the mapping for resurrection. Garbage collection retains every token referenced
 by an active or exited Zellij `session-layout.kdl`, then removes unreferenced
-mappings older than seven days:
+mappings older than seven days.
+
+Cleanup runs automatically, at most once per day, when the supervisor starts.
+No cron job or systemd timer is required. The explicit command remains useful
+for diagnostics and immediate cleanup:
 
 ```console
 zellij-agent-deck-codex gc
 ```
 
-Run this command daily. Override the grace period with `--retention-days` or
+Override the grace period with `--retention-days` or
 `ZELLIJ_AGENT_DECK_RESURRECTION_RETENTION_DAYS`. The state and Zellij cache
 roots can be overridden with `ZELLIJ_AGENT_DECK_RESURRECTION_DIR` and
 `ZELLIJ_AGENT_DECK_ZELLIJ_CACHE_DIR`, which is also useful for testing.
@@ -160,12 +185,13 @@ Run the complete local gate at any time:
 
 ```console
 pre-commit run --all-files
-nix build path:.
+nix flake check path:.
 ```
 
 The pre-commit gate checks file hygiene, private keys and secrets, Python lint,
 formatting and types, Rust formatting and Clippy, unit tests, and Nix formatting
-and evaluation. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the contribution
+and evaluation. Flake checks independently build the package and run the Python
+and Rust tests. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the contribution
 workflow.
 
 ## License

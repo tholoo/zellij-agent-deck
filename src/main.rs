@@ -107,12 +107,103 @@ fn jump_plan(current_session: &str, agent: &AgentRecord) -> Result<Vec<JumpActio
 }
 
 #[derive(Default)]
-struct AgentDeck {
-    helper: String,
-    current_session: String,
+struct DeckModel {
     agents: Vec<AgentRecord>,
     selected: usize,
     filter: usize,
+    query: String,
+    viewport_start: usize,
+    viewport_len: usize,
+}
+
+impl DeckModel {
+    fn matches_filter(&self, agent: &AgentRecord) -> bool {
+        match self.filter {
+            1 => is_attached(agent) && agent.unread,
+            2 => is_attached(agent) && (agent.status == "working" || agent.status == "idle"),
+            3 => is_attached(agent) && agent.status == "needs_input",
+            4 => is_attached(agent) && agent.status == "done",
+            5 => is_attached(agent) && agent.status == "parked",
+            6 => is_resumable(agent),
+            _ => is_attached(agent),
+        }
+    }
+
+    fn matching_indices(&self, live_query: Option<&str>) -> Vec<usize> {
+        let query = live_query.unwrap_or(&self.query).to_lowercase();
+        self.agents
+            .iter()
+            .enumerate()
+            .filter(|(_, agent)| {
+                self.matches_filter(agent)
+                    && (query.is_empty()
+                        || format!(
+                            "{} {} {} {}",
+                            agent.project, agent.title, agent.branch, agent.message
+                        )
+                        .to_lowercase()
+                        .contains(&query))
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn selected_agent(&self, live_query: Option<&str>) -> Option<AgentRecord> {
+        self.matching_indices(live_query)
+            .get(self.selected)
+            .and_then(|index| self.agents.get(*index))
+            .cloned()
+    }
+
+    fn clamp_selection(&mut self, live_query: Option<&str>) {
+        let len = self.matching_indices(live_query).len();
+        self.selected = self.selected.min(len.saturating_sub(1));
+    }
+
+    fn move_selection(&mut self, delta: isize, live_query: Option<&str>) {
+        let len = self.matching_indices(live_query).len();
+        if len == 0 {
+            self.selected = 0;
+        } else {
+            self.selected = (self.selected as isize + delta).rem_euclid(len as isize) as usize;
+        }
+    }
+
+    fn set_filter(&mut self, filter: usize) {
+        self.filter = filter;
+        self.selected = 0;
+    }
+
+    fn set_query(&mut self, query: String) {
+        self.query = query;
+        self.selected = 0;
+    }
+
+    fn clear_query(&mut self) {
+        self.set_query(String::new());
+    }
+
+    fn update_viewport(&mut self, list_height: usize, matching_len: usize) {
+        self.viewport_start = self.selected.saturating_sub(list_height.saturating_sub(1));
+        self.viewport_len = matching_len
+            .saturating_sub(self.viewport_start)
+            .min(list_height);
+    }
+
+    fn select_viewport_row(&mut self, row: usize) -> bool {
+        if row >= self.viewport_len {
+            return false;
+        }
+        self.selected = self.viewport_start + row;
+        true
+    }
+}
+
+#[derive(Default)]
+struct AgentDeck {
+    helper: String,
+    current_session: String,
+    model: DeckModel,
     mode: InputMode,
     input: String,
     staged: String,
@@ -185,64 +276,28 @@ impl AgentDeck {
         self.run_helper_with_context(&args, context);
     }
 
-    fn matches_filter(&self, agent: &AgentRecord) -> bool {
-        match self.filter {
-            1 => is_attached(agent) && agent.unread,
-            2 => is_attached(agent) && (agent.status == "working" || agent.status == "idle"),
-            3 => is_attached(agent) && agent.status == "needs_input",
-            4 => is_attached(agent) && agent.status == "done",
-            5 => is_attached(agent) && agent.status == "parked",
-            6 => is_resumable(agent),
-            _ => is_attached(agent),
-        }
-    }
-
     fn matching_indices(&self) -> Vec<usize> {
-        let query = if self.mode == InputMode::Search {
-            self.input.to_lowercase()
+        let live_query = if self.mode == InputMode::Search {
+            Some(self.input.as_str())
         } else {
-            self.staged
-                .strip_prefix("search:")
-                .unwrap_or("")
-                .to_lowercase()
+            None
         };
-        self.agents
-            .iter()
-            .enumerate()
-            .filter(|(_, agent)| {
-                self.matches_filter(agent)
-                    && (query.is_empty()
-                        || format!(
-                            "{} {} {} {}",
-                            agent.project, agent.title, agent.branch, agent.message
-                        )
-                        .to_lowercase()
-                        .contains(&query))
-            })
-            .map(|(index, _)| index)
-            .collect()
+        self.model.matching_indices(live_query)
     }
 
     fn selected_agent(&self) -> Option<AgentRecord> {
-        let matches = self.matching_indices();
-        matches
-            .get(self.selected)
-            .and_then(|index| self.agents.get(*index))
-            .cloned()
+        let live_query = (self.mode == InputMode::Search).then_some(self.input.as_str());
+        self.model.selected_agent(live_query)
     }
 
     fn clamp_selection(&mut self) {
-        let len = self.matching_indices().len();
-        self.selected = self.selected.min(len.saturating_sub(1));
+        let live_query = (self.mode == InputMode::Search).then_some(self.input.clone());
+        self.model.clamp_selection(live_query.as_deref());
     }
 
     fn move_selection(&mut self, delta: isize) {
-        let len = self.matching_indices().len();
-        if len == 0 {
-            self.selected = 0;
-        } else {
-            self.selected = (self.selected as isize + delta).rem_euclid(len as isize) as usize;
-        }
+        let live_query = (self.mode == InputMode::Search).then_some(self.input.clone());
+        self.model.move_selection(delta, live_query.as_deref());
     }
 
     fn set_input_mode(&mut self, mode: InputMode, prompt: &str) {
@@ -293,13 +348,14 @@ impl AgentDeck {
 
     fn apply_agent_signal(&mut self, agent: AgentRecord) {
         if let Some(existing) = self
+            .model
             .agents
             .iter_mut()
             .find(|existing| existing.key == agent.key)
         {
             *existing = agent.clone();
         } else {
-            self.agents.push(agent.clone());
+            self.model.agents.push(agent.clone());
         }
         self.clamp_selection();
         if self.permissions_granted {
@@ -310,6 +366,9 @@ impl AgentDeck {
     }
 
     fn sync_agent_pane(&self, agent: &AgentRecord) {
+        if agent.zellij_session != self.current_session {
+            return;
+        }
         if let Some(pane_id) = agent.pane_id {
             let pane = PaneId::Terminal(pane_id);
             let wants_attention =
@@ -326,7 +385,7 @@ impl AgentDeck {
 
     fn handle_closed_pane(&mut self, pane_id: u32) {
         let requests =
-            detach_requests_for_closed_pane(&self.current_session, pane_id, &self.agents);
+            detach_requests_for_closed_pane(&self.current_session, pane_id, &self.model.agents);
         for request in &requests {
             self.run_helper(
                 "detach-pane",
@@ -337,7 +396,7 @@ impl AgentDeck {
                 ],
             );
         }
-        for agent in &mut self.agents {
+        for agent in &mut self.model.agents {
             if requests.iter().any(|request| {
                 request.key == agent.key && request.attachment_id == agent.attachment_id
             }) {
@@ -357,10 +416,10 @@ impl AgentDeck {
         self.current_session = get_session_environment_variables()
             .remove("ZELLIJ_SESSION_NAME")
             .unwrap_or_default();
-        for agent in &self.agents {
+        for agent in &self.model.agents {
             self.sync_agent_pane(agent);
         }
-        set_timeout(3.0);
+        set_timeout(15.0);
         self.refresh(false, true);
         hide_self();
     }
@@ -369,14 +428,13 @@ impl AgentDeck {
         let value = self.input.trim().to_owned();
         match self.mode {
             InputMode::Search => {
-                self.staged = format!("search:{value}");
+                self.model.set_query(value.clone());
                 self.mode = InputMode::Browse;
                 self.notice = if value.is_empty() {
                     String::new()
                 } else {
                     format!("filter: {value}")
                 };
-                self.selected = 0;
             }
             InputMode::Reply if !value.is_empty() => {
                 self.staged = value;
@@ -457,12 +515,11 @@ impl AgentDeck {
                     self.refresh(true, true);
                 }
                 BareKey::Char('c') => {
-                    self.staged.clear();
+                    self.model.clear_query();
                     self.notice.clear();
                 }
                 BareKey::Char(ch @ '1'..='7') => {
-                    self.filter = ch as usize - '1' as usize;
-                    self.selected = 0;
+                    self.model.set_filter(ch as usize - '1' as usize);
                 }
                 _ => {}
             },
@@ -499,7 +556,7 @@ impl AgentDeck {
             match serde_json::from_slice::<Vec<AgentRecord>>(&stdout) {
                 Ok(agents) => {
                     self.applied_list_request = request_id;
-                    self.agents = agents;
+                    self.model.agents = agents;
                     self.clamp_selection();
                     if self.notice.starts_with("Refreshing") {
                         self.notice = "Metadata refreshed".into();
@@ -545,9 +602,9 @@ impl ZellijPlugin for AgentDeck {
                 return true;
             }
             Event::Mouse(Mouse::LeftClick(line, _)) if line >= 3 => {
-                self.selected = (line as usize).saturating_sub(3);
-                self.clamp_selection();
-                return true;
+                return self
+                    .model
+                    .select_viewport_row((line as usize).saturating_sub(3));
             }
             Event::Visible(visible) => {
                 self.visible = visible;
@@ -558,7 +615,7 @@ impl ZellijPlugin for AgentDeck {
             Event::Timer(_) => {
                 self.refresh_ticks = self.refresh_ticks.wrapping_add(1);
                 self.refresh(false, self.refresh_ticks.is_multiple_of(10));
-                set_timeout(3.0);
+                set_timeout(if self.visible { 3.0 } else { 15.0 });
             }
             Event::PaneClosed(PaneId::Terminal(pane_id)) => {
                 self.handle_closed_pane(pane_id);
@@ -597,21 +654,25 @@ impl ZellijPlugin for AgentDeck {
     fn render(&mut self, rows: usize, cols: usize) {
         let width = cols.saturating_sub(2);
         let live = self
+            .model
             .agents
             .iter()
             .filter(|agent| is_attached(agent))
             .count();
         let resumable = self
+            .model
             .agents
             .iter()
             .filter(|agent| is_resumable(agent))
             .count();
         let unread = self
+            .model
             .agents
             .iter()
             .filter(|agent| is_attached(agent) && agent.unread)
             .count();
         let waiting = self
+            .model
             .agents
             .iter()
             .filter(|agent| is_attached(agent) && agent.status == "needs_input")
@@ -629,7 +690,7 @@ impl ZellijPlugin for AgentDeck {
             .iter()
             .enumerate()
             .map(|(index, name)| {
-                if self.filter == index {
+                if self.model.filter == index {
                     format!("[{}:{}]", index + 1, name)
                 } else {
                     format!(" {}:{} ", index + 1, name)
@@ -647,12 +708,13 @@ impl ZellijPlugin for AgentDeck {
 
         let matching = self.matching_indices();
         let list_height = rows.saturating_sub(8);
-        let scroll = self.selected.saturating_sub(list_height.saturating_sub(1));
+        self.model.update_viewport(list_height, matching.len());
+        let scroll = self.model.viewport_start;
         for (screen_index, agent_index) in
             matching.iter().skip(scroll).take(list_height).enumerate()
         {
-            let agent = &self.agents[*agent_index];
-            let cursor = if scroll + screen_index == self.selected {
+            let agent = &self.model.agents[*agent_index];
+            let cursor = if scroll + screen_index == self.model.selected {
                 "›"
             } else {
                 " "
@@ -665,7 +727,7 @@ impl ZellijPlugin for AgentDeck {
                 agent.project, agent.title
             );
             let text = Text::new(truncate(&label, width));
-            let text = if scroll + screen_index == self.selected {
+            let text = if scroll + screen_index == self.model.selected {
                 text.color_all(3)
             } else {
                 text
@@ -836,7 +898,7 @@ mod tests {
         );
 
         assert!(deck.pipe(message));
-        assert_eq!(deck.agents.len(), 1);
+        assert_eq!(deck.model.agents.len(), 1);
     }
 
     #[test]
@@ -876,7 +938,7 @@ mod tests {
         deck.handle_result(Some(0), b"[]".to_vec(), Vec::new(), latest);
         deck.handle_result(Some(0), dismissed, Vec::new(), stale);
 
-        assert!(deck.agents.is_empty());
+        assert!(deck.model.agents.is_empty());
     }
 
     #[test]
@@ -906,33 +968,58 @@ mod tests {
     #[test]
     fn live_filter_hides_detached_sessions_and_resume_filter_restores_them() {
         let mut deck = AgentDeck {
-            agents: vec![
-                AgentRecord {
-                    key: "codex:live".into(),
-                    zellij_session: "work".into(),
-                    pane_id: Some(7),
-                    ..Default::default()
-                },
-                AgentRecord {
-                    key: "codex:resume".into(),
-                    codex_session_id: "session-id".into(),
-                    pane_id: None,
-                    ..Default::default()
-                },
-                AgentRecord {
-                    key: "subagent:hidden".into(),
-                    kind: "subagent".into(),
-                    codex_session_id: "session-id".into(),
-                    pane_id: None,
-                    ..Default::default()
-                },
-            ],
+            model: DeckModel {
+                agents: vec![
+                    AgentRecord {
+                        key: "codex:live".into(),
+                        zellij_session: "work".into(),
+                        pane_id: Some(7),
+                        ..Default::default()
+                    },
+                    AgentRecord {
+                        key: "codex:resume".into(),
+                        codex_session_id: "session-id".into(),
+                        pane_id: None,
+                        ..Default::default()
+                    },
+                    AgentRecord {
+                        key: "subagent:hidden".into(),
+                        kind: "subagent".into(),
+                        codex_session_id: "session-id".into(),
+                        pane_id: None,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
             ..Default::default()
         };
 
         assert_eq!(deck.matching_indices(), vec![0]);
-        deck.filter = 6;
+        deck.model.set_filter(6);
         assert_eq!(deck.matching_indices(), vec![1]);
+    }
+
+    #[test]
+    fn clicking_a_scrolled_row_selects_its_viewport_item() {
+        let mut model = DeckModel {
+            agents: (0..10)
+                .map(|pane_id| AgentRecord {
+                    key: format!("codex:{pane_id}"),
+                    zellij_session: "work".into(),
+                    pane_id: Some(pane_id),
+                    ..Default::default()
+                })
+                .collect(),
+            selected: 7,
+            ..Default::default()
+        };
+
+        model.update_viewport(3, model.matching_indices(None).len());
+
+        assert!(model.select_viewport_row(1));
+        assert_eq!(model.selected_agent(None).unwrap().key, "codex:6");
+        assert!(!model.select_viewport_row(3));
     }
 
     #[test]

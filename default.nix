@@ -7,9 +7,9 @@
   makeRustPlatform,
   makeWrapper,
   python3,
-  zellij,
 }:
 let
+  manifest = builtins.fromTOML (builtins.readFile ./Cargo.toml);
   rustToolchain = fenix.combine [
     fenix.latest.rustc
     fenix.latest.cargo
@@ -22,14 +22,17 @@ let
 in
 rustPlatform.buildRustPackage {
   pname = "zellij-agent-deck";
-  version = "0.1.0";
+  inherit (manifest.package) version;
 
   src = lib.cleanSource ./.;
 
   cargoLock.lockFile = ./Cargo.lock;
   doCheck = false; # Zellij's SDK pulls host-only libraries for native tests.
 
-  nativeBuildInputs = [ makeWrapper ];
+  nativeBuildInputs = [
+    makeWrapper
+    python3
+  ];
 
   # The standard nixpkgs Cargo hook always adds the host target. Zellij plugins
   # are WASI-only, so avoid a second host build (and its OpenSSL dependency).
@@ -46,7 +49,10 @@ rustPlatform.buildRustPackage {
       $out/share/zellij/plugins/agent-deck.wasm
     install -Dm755 agent_deck.py $out/bin/zellij-agent-deck
     install -Dm755 codex_resurrection.py $out/bin/zellij-agent-deck-codex
-    patchShebangs $out/bin/zellij-agent-deck $out/bin/zellij-agent-deck-codex
+    install -Dm644 examples/hooks.json $out/share/doc/zellij-agent-deck/examples/hooks.json
+    install -Dm644 examples/zellij.kdl $out/share/doc/zellij-agent-deck/examples/zellij.kdl
+    substituteInPlace $out/bin/zellij-agent-deck $out/bin/zellij-agent-deck-codex \
+      --replace-fail '#!/usr/bin/env python3' '#!${python3}/bin/python3'
     wrapProgram $out/bin/zellij-agent-deck \
       --prefix PATH : ${
         lib.makeBinPath [
@@ -54,11 +60,18 @@ rustPlatform.buildRustPackage {
           git
           iproute2
           python3
-          zellij
         ]
       }
 
     runHook postInstall
+  '';
+
+  doInstallCheck = true;
+  installCheckPhase = ''
+    PATH=/path-that-does-not-exist $out/bin/zellij-agent-deck --help >/dev/null
+    PATH=/path-that-does-not-exist $out/bin/zellij-agent-deck-codex --help >/dev/null
+    test -f $out/share/doc/zellij-agent-deck/examples/hooks.json
+    test -f $out/share/doc/zellij-agent-deck/examples/zellij.kdl
   '';
 
   meta = {

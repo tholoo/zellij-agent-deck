@@ -17,7 +17,7 @@ Run the full local gate before opening a pull request:
 
 ```console
 pre-commit run --all-files
-nix build path:.
+nix flake check path:.
 ```
 
 ## Pull requests

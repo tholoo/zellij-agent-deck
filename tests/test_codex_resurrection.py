@@ -69,7 +69,13 @@ class CodexResurrectionTest(unittest.TestCase):
         token = "00000000-0000-4000-8000-000000000008"
         calls = self.root / "codex-calls"
         real_codex = self.root / "codex-real"
-        real_codex.write_text('#!/usr/bin/env bash\nprintf \'%s\\n\' "$*" > "$CODEX_CALLS"\n')
+        real_codex.write_text(
+            f"#!{sys.executable}\n"
+            "import os\n"
+            "import sys\n"
+            "from pathlib import Path\n"
+            'Path(os.environ["CODEX_CALLS"]).write_text(" ".join(sys.argv[1:]) + "\\n")\n'
+        )
         real_codex.chmod(0o700)
         with patch.dict(os.environ, {resurrection.TOKEN_ENV: token}):
             resurrection.record_session({"session_id": "session-eight"})
@@ -126,6 +132,20 @@ class CodexResurrectionTest(unittest.TestCase):
             ],
         )
 
+    def test_passthrough_clears_an_inherited_supervisor_token(self):
+        token = "00000000-0000-4000-8000-000000000009"
+        with (
+            patch.dict(os.environ, {resurrection.TOKEN_ENV: token, "ZELLIJ": "0"}),
+            patch.object(resurrection.os, "execv") as execv,
+        ):
+            resurrection.supervise("/real/codex", None, ["exec", "nested task"])
+
+            self.assertNotIn(resurrection.TOKEN_ENV, os.environ)
+        self.assertEqual(
+            execv.call_args.args,
+            ("/real/codex", ["/real/codex", "exec", "nested task"]),
+        )
+
     def test_gc_keeps_referenced_and_recent_mappings(self):
         referenced = "00000000-0000-4000-8000-000000000004"
         old_orphan = "00000000-0000-4000-8000-000000000005"
@@ -176,6 +196,32 @@ class CodexResurrectionTest(unittest.TestCase):
         self.assertEqual(status, 0)
         summary = "".join(call.args[0] for call in stdout.write.call_args_list)
         self.assertEqual(json.loads(summary), {"removed": ["token-one"], "removed_count": 1})
+
+    def test_automatic_gc_is_rate_limited(self):
+        with (
+            patch.object(resurrection, "gc_resurrections", return_value=[]) as gc,
+            patch.object(resurrection.time, "time", side_effect=[100_000.0, 100_001.0]),
+        ):
+            self.assertTrue(resurrection.maybe_gc_resurrections(interval_seconds=3600))
+            self.assertFalse(resurrection.maybe_gc_resurrections(interval_seconds=3600))
+
+        gc.assert_called_once()
+
+    def test_invalid_retention_does_not_prevent_supervisor_start(self):
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "ZELLIJ": "0",
+                    resurrection.RETENTION_DAYS_ENV: "not-a-number",
+                },
+            ),
+            patch.object(resurrection.uuid, "uuid4", return_value=resurrection.uuid.UUID(int=10)),
+            patch.object(resurrection.os, "execv") as execv,
+        ):
+            resurrection.supervise("/real/codex", None, [])
+
+        self.assertTrue(execv.called)
 
 
 if __name__ == "__main__":
