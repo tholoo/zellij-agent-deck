@@ -8,6 +8,11 @@
             "type": "command",
             "command": "zellij-agent-deck hook",
             "timeout": 4
+          },
+          {
+            "type": "command",
+            "command": "zellij-agent-deck-codex hook",
+            "timeout": 4
           }
         ]
       }

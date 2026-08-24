@@ -8,6 +8,9 @@ is based on Keep a Changelog, and the project follows Semantic Versioning.
 ### Added
 
 - Synthetic Agent Deck screenshot for the project documentation.
+- Exact Codex session resurrection for plain Codex commands serialized by
+  Zellij, including exit cleanup plus reference-aware and age-based garbage
+  collection.
 
 ### Fixed
 

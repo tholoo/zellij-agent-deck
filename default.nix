@@ -45,7 +45,8 @@ rustPlatform.buildRustPackage {
     install -Dm644 target/wasm32-wasip1/release/zellij-agent-deck.wasm \
       $out/share/zellij/plugins/agent-deck.wasm
     install -Dm755 agent_deck.py $out/bin/zellij-agent-deck
-    patchShebangs $out/bin/zellij-agent-deck
+    install -Dm755 codex_resurrection.py $out/bin/zellij-agent-deck-codex
+    patchShebangs $out/bin/zellij-agent-deck $out/bin/zellij-agent-deck-codex
     wrapProgram $out/bin/zellij-agent-deck \
       --prefix PATH : ${
         lib.makeBinPath [

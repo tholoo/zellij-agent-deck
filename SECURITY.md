@@ -16,7 +16,8 @@ will be coordinated before details are made public.
 
 ## Sensitive local data
 
-Agent Deck stores bounded status data in an owner-only runtime directory. It
-does not require an OpenAI API key. Reports and test fixtures must not contain
-real prompts, transcripts, tokens, private repository paths, or runtime record
-files.
+Agent Deck stores bounded status data in an owner-only runtime directory. Exact
+resurrection additionally stores Codex session IDs in owner-only files under
+`${XDG_STATE_HOME:-~/.local/state}/codex/zellij-sessions`. It does not require
+an OpenAI API key. Reports and test fixtures must not contain real prompts,
+transcripts, tokens, private repository paths, or runtime record files.

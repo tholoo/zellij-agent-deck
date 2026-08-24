@@ -34,7 +34,7 @@ repos:
     hooks:
       - id: mypy
         name: mypy
-        entry: mypy agent_deck.py
+        entry: mypy agent_deck.py codex_resurrection.py
         language: system
         pass_filenames: false
         types: [python]

@@ -100,6 +100,53 @@ ZELLIJ_AGENT_DECK_CODEX_PREFIX='["command-wrapper","--quiet"]' \
 
 The deck records and propagates that prefix to resumed and worktree sessions.
 
+## Exact Zellij resurrection
+
+Agent Deck can make a plain `codex` command resume its exact Codex session when
+Zellij resurrects a command pane. This remains unambiguous when multiple Codex
+agents use the same working directory.
+
+Create a `codex` launcher earlier on `PATH` than the real Codex executable. Set
+`real_codex` to the absolute path of that executable to avoid wrapper recursion:
+
+```bash
+#!/usr/bin/env bash
+exec zellij-agent-deck-codex codex-supervisor \
+  --codex /absolute/path/to/real/codex -- "$@"
+```
+
+Add the resurrection hook alongside the existing Agent Deck hook under
+`SessionStart`; [`examples/hooks.json`](examples/hooks.json) includes both:
+
+```json
+{
+  "type": "command",
+  "command": "zellij-agent-deck-codex hook",
+  "timeout": 4
+}
+```
+
+The launcher gives each zero-argument `codex` process in Zellij a stable token.
+The `SessionStart` hook privately maps that token to the exact Codex session ID.
+Explicit Codex arguments and non-Zellij launches pass directly to real Codex.
+
+Mappings remain compatible with existing integrations at
+`${XDG_STATE_HOME:-~/.local/state}/codex/zellij-sessions`. Successful lookup
+refreshes a mapping's age. A normal Codex exit removes its mapping immediately;
+terminating the Zellij session kills the supervisor and deliberately preserves
+the mapping for resurrection. Garbage collection retains every token referenced
+by an active or exited Zellij `session-layout.kdl`, then removes unreferenced
+mappings older than seven days:
+
+```console
+zellij-agent-deck-codex gc
+```
+
+Run this command daily. Override the grace period with `--retention-days` or
+`ZELLIJ_AGENT_DECK_RESURRECTION_RETENTION_DAYS`. The state and Zellij cache
+roots can be overridden with `ZELLIJ_AGENT_DECK_RESURRECTION_DIR` and
+`ZELLIJ_AGENT_DECK_ZELLIJ_CACHE_DIR`, which is also useful for testing.
+
 ## Development
 
 Enter the pinned development environment and install the Git hook once:
