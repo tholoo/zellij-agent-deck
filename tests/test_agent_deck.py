@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 import tempfile
 import unittest
@@ -51,6 +52,72 @@ class AgentDeckTest(unittest.TestCase):
         self.assertEqual((waiting["status"], waiting["unread"]), ("needs_input", True))
         done = self.event("Stop", last_assistant_message="Implemented it")
         self.assertEqual((done["status"], done["message"]), ("done", "Implemented it"))
+
+    def test_session_end_detaches_parent_and_subagents_but_keeps_resume_data(self):
+        parent = self.event("SessionStart")
+        child = self.event("SubagentStart", agent_id="child", agent_type="worker")
+
+        ended = self.event("SessionEnd")
+        stored_child = deck.lookup(child["key"])
+
+        self.assertIsNone(ended["pane_id"])
+        self.assertEqual(ended["attachment_id"], "")
+        self.assertEqual(ended["codex_session_id"], "abc")
+        self.assertIsNone(stored_child["pane_id"])
+        self.assertEqual(stored_child["attachment_id"], "")
+        self.assertEqual(parent["codex_session_id"], ended["codex_session_id"])
+
+    def test_resume_rotates_attachment_generation_and_stale_close_is_ignored(self):
+        first = self.event("SessionStart")
+        first_attachment = first["attachment_id"]
+
+        resumed = self.event("SessionStart")
+        resumed_attachment = resumed["attachment_id"]
+        stale = deck.detach_attachment(resumed["key"], first_attachment)
+
+        self.assertTrue(first_attachment)
+        self.assertNotEqual(first_attachment, resumed_attachment)
+        self.assertEqual(stale["pane_id"], 7)
+        self.assertEqual(stale["attachment_id"], resumed_attachment)
+
+        detached = deck.detach_attachment(resumed["key"], resumed_attachment)
+        self.assertIsNone(detached["pane_id"])
+        self.assertEqual(detached["attachment_id"], "")
+        self.assertEqual(detached["status"], "ended")
+
+    def test_reconciliation_detaches_a_record_when_its_pane_is_missing(self):
+        record = self.event("SessionStart")
+        sessions = deck.subprocess.CompletedProcess([], 0, "dev [Created 1m ago] (current)\n", "")
+        panes = deck.subprocess.CompletedProcess([], 0, json.dumps([]), "")
+
+        with patch.object(deck, "run", side_effect=[sessions, panes]):
+            deck.reconcile_records(force=True)
+
+        reconciled = deck.lookup(record["key"])
+        self.assertIsNone(reconciled["pane_id"])
+        self.assertEqual(reconciled["attachment_id"], "")
+
+    def test_reconciliation_detaches_records_from_a_dead_zellij_session(self):
+        record = self.event("SessionStart")
+        sessions = deck.subprocess.CompletedProcess(
+            [], 0, "dev [Created 1m ago] (EXITED - attach to resurrect)\n", ""
+        )
+
+        with patch.object(deck, "run", return_value=sessions) as run:
+            deck.reconcile_records(force=True)
+
+        self.assertIsNone(deck.lookup(record["key"])["pane_id"])
+        self.assertEqual(run.call_count, 1)
+
+    def test_reconciliation_keeps_records_when_pane_query_fails(self):
+        record = self.event("SessionStart")
+        sessions = deck.subprocess.CompletedProcess([], 0, "dev [Created 1m ago] (current)\n", "")
+        failed_panes = deck.subprocess.CompletedProcess([], 1, "", "temporary failure")
+
+        with patch.object(deck, "run", side_effect=[sessions, failed_panes]):
+            deck.reconcile_records(force=True)
+
+        self.assertEqual(deck.lookup(record["key"])["pane_id"], 7)
 
     def test_manual_title_survives_new_prompts(self):
         self.event("UserPromptSubmit", prompt="first")
@@ -144,6 +211,18 @@ class AgentDeckTest(unittest.TestCase):
                 "abc",
             ],
         )
+
+    def test_resume_uses_current_session_when_recorded_session_is_dead(self):
+        record = self.event("SessionStart")
+        record["pane_id"] = None
+        record["attachment_id"] = ""
+        with (
+            patch.object(deck, "zellij_sessions", return_value={"dev": False, "current": True}),
+            patch.object(deck.subprocess, "run") as run,
+        ):
+            deck.do_resume(record, fallback_session="current")
+
+        self.assertEqual(run.call_args.args[0][1:3], ["--session", "current"])
 
     def test_worktree_replays_recorded_launcher_prefix(self):
         root = Path(self.temp.name) / "project"

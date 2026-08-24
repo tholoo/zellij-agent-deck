@@ -12,6 +12,7 @@ import contextlib
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -28,6 +29,7 @@ SAFE_BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,79}$")
 PREFIX_ENV = "ZELLIJ_AGENT_DECK_CODEX_PREFIX"
 PREFIX_ARG_LIMIT = 16
 PREFIX_ARG_LENGTH = 256
+RECONCILE_INTERVAL = 5
 
 
 def clean(value: Any, limit: int) -> str:
@@ -73,6 +75,19 @@ def records(include_dismissed: bool = False) -> list[dict[str, Any]]:
         record = read_record(path)
         if not record:
             continue
+        migrated = False
+        if record.get("status") == "ended" and record.get("pane_id") is not None:
+            record["pane_id"] = None
+            record["attachment_id"] = ""
+            migrated = True
+        elif record.get("pane_id") is not None and not record.get("attachment_id"):
+            record["attachment_id"] = secrets.token_hex(16)
+            migrated = True
+        elif record.get("pane_id") is None and record.get("attachment_id"):
+            record["attachment_id"] = ""
+            migrated = True
+        if migrated:
+            write_record(record)
         if record.get("updated_at", 0) < cutoff:
             with contextlib.suppress(OSError):
                 path.unlink()
@@ -227,14 +242,17 @@ def base_record(payload: dict[str, Any], key: str, kind: str = "codex") -> dict[
     cwd = clean(payload.get("cwd") or os.getcwd(), 512)
     metadata = project_metadata(cwd)
     stamp = now()
+    zellij_session = clean(os.environ.get("ZELLIJ_SESSION_NAME"), 128)
+    pane_id = pane_number(os.environ.get("ZELLIJ_PANE_ID"))
     return {
         "schema": SCHEMA,
         "key": key,
         "kind": kind,
         "codex_session_id": clean(payload.get("session_id"), 128),
         "parent_key": "",
-        "zellij_session": clean(os.environ.get("ZELLIJ_SESSION_NAME"), 128),
-        "pane_id": pane_number(os.environ.get("ZELLIJ_PANE_ID")),
+        "zellij_session": zellij_session,
+        "pane_id": pane_id,
+        "attachment_id": secrets.token_hex(16) if zellij_session and pane_id is not None else "",
         "launcher_prefix": launcher_prefix(),
         **metadata,
         "title": "Codex session",
@@ -313,10 +331,23 @@ def handle_event(payload: dict[str, Any]) -> dict[str, Any]:
     # Pane/session can change after a resume, so hook environment always wins.
     zellij_session = clean(os.environ.get("ZELLIJ_SESSION_NAME"), 128)
     current_pane = pane_number(os.environ.get("ZELLIJ_PANE_ID"))
+    previous_session = record.get("zellij_session")
+    previous_pane = record.get("pane_id")
     if zellij_session:
         record["zellij_session"] = zellij_session
     if current_pane is not None:
         record["pane_id"] = current_pane
+    if (
+        zellij_session
+        and current_pane is not None
+        and (
+            event == "SessionStart"
+            or not record.get("attachment_id")
+            or previous_session != zellij_session
+            or previous_pane != current_pane
+        )
+    ):
+        record["attachment_id"] = secrets.token_hex(16)
     if event == "SessionStart" or "launcher_prefix" not in record:
         record["launcher_prefix"] = launcher_prefix()
     cwd = clean(payload.get("cwd") or record.get("cwd") or os.getcwd(), 512)
@@ -351,6 +382,8 @@ def handle_event(payload: dict[str, Any]) -> dict[str, Any]:
     elif event == "SessionEnd":
         record["status"] = "ended"
         record["unread"] = False
+        record["pane_id"] = None
+        record["attachment_id"] = ""
     elif event == "SessionStart":
         record["status"] = "idle"
         record["unread"] = False
@@ -361,7 +394,120 @@ def handle_event(payload: dict[str, Any]) -> dict[str, Any]:
     record["updated_at"] = now()
     write_record(record)
     pipe_event(record)
+    if event == "SessionEnd":
+        detach_session_records(session_id, excluding_key=key)
     return record
+
+
+def detach_record(record: dict[str, Any]) -> dict[str, Any]:
+    record["pane_id"] = None
+    record["attachment_id"] = ""
+    if record.get("status") != "parked":
+        record["status"] = "ended"
+    record["unread"] = False
+    record["updated_at"] = now()
+    write_record(record)
+    pipe_event(record)
+    return record
+
+
+def detach_attachment(key: str, attachment_id: str) -> dict[str, Any]:
+    record = lookup(key)
+    if not attachment_id or record.get("attachment_id") != attachment_id:
+        return record
+    return detach_record(record)
+
+
+def detach_session_records(session_id: str, excluding_key: str = "") -> list[dict[str, Any]]:
+    detached = []
+    for path in state_dir().glob("*.json"):
+        record = read_record(path)
+        if (
+            not record
+            or record.get("key") == excluding_key
+            or record.get("codex_session_id") != session_id
+            or record.get("pane_id") is None
+        ):
+            continue
+        detached.append(detach_record(record))
+    return detached
+
+
+def zellij_sessions() -> dict[str, bool] | None:
+    if not shutil.which("zellij"):
+        return None
+    try:
+        result = run(["zellij", "list-sessions", "--no-formatting"], timeout=2.0)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    sessions = {}
+    for line in result.stdout.splitlines():
+        name, separator, _ = line.partition(" [Created ")
+        if separator and name:
+            sessions[name] = "(EXITED" not in line
+    return sessions
+
+
+def zellij_panes(session: str) -> set[int] | None:
+    try:
+        result = run(
+            ["zellij", "--session", session, "action", "list-panes", "--json"], timeout=2.0
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        panes = json.loads(result.stdout)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(panes, list):
+        return None
+    result_ids = set()
+    for pane in panes:
+        if not isinstance(pane, dict) or pane.get("is_plugin") or pane.get("exited"):
+            continue
+        pane_id = pane_number(pane.get("id", pane.get("pane_id")))
+        if pane_id is not None:
+            result_ids.add(pane_id)
+    return result_ids
+
+
+def reconcile_records(force: bool = False) -> list[dict[str, Any]]:
+    marker = state_dir() / ".last-reconcile"
+    if not force:
+        with contextlib.suppress(OSError):
+            if time.time() - marker.stat().st_mtime < RECONCILE_INTERVAL:
+                return []
+    sessions = zellij_sessions()
+    if sessions is None:
+        return []
+    with contextlib.suppress(OSError):
+        marker.touch()
+
+    panes_by_session: dict[str, set[int] | None] = {}
+    detached = []
+    for path in state_dir().glob("*.json"):
+        record = read_record(path)
+        if not record or record.get("pane_id") is None:
+            continue
+        session = str(record.get("zellij_session") or "")
+        session_is_live = sessions.get(session, False)
+        missing = not session_is_live
+        if session_is_live:
+            if session not in panes_by_session:
+                panes_by_session[session] = zellij_panes(session)
+            live_panes = panes_by_session[session]
+            missing = live_panes is not None and record.get("pane_id") not in live_panes
+        if missing:
+            attachment_id = str(record.get("attachment_id") or "")
+            if attachment_id:
+                detached.append(detach_attachment(record["key"], attachment_id))
+            else:
+                detached.append(detach_record(record))
+    return detached
 
 
 def mutate(key: str, **changes: Any) -> dict[str, Any]:
@@ -394,11 +540,16 @@ def do_park(record: dict[str, Any]) -> None:
     mutate(record["key"], status="parked", unread=False, message="Parked; press R to resume")
 
 
-def do_resume(record: dict[str, Any]) -> None:
+def do_resume(record: dict[str, Any], fallback_session: str = "") -> None:
     session_id = record.get("codex_session_id")
     if not session_id:
         raise SystemExit("agent has no resumable Codex session id")
-    session = record.get("zellij_session") or clean(os.environ.get("ZELLIJ_SESSION_NAME"), 128)
+    recorded_session = clean(record.get("zellij_session"), 128)
+    fallback_session = clean(fallback_session or os.environ.get("ZELLIJ_SESSION_NAME"), 128)
+    session = recorded_session or fallback_session
+    sessions = zellij_sessions()
+    if sessions is not None and recorded_session and not sessions.get(recorded_session, False):
+        session = fallback_session
     if not session:
         raise SystemExit("agent has no Zellij session")
     title = clean(f"{record.get('project')}: {record.get('title')}", 80)
@@ -416,7 +567,13 @@ def do_resume(record: dict[str, Any]) -> None:
         *codex_command(record, "resume", "-C", record["cwd"], session_id),
     ]
     subprocess.run(command, check=True)
-    mutate(record["key"], status="working", unread=False, message="Resuming in a new pane")
+    mutate(
+        record["key"],
+        zellij_session=session,
+        status="working",
+        unread=False,
+        message="Resuming in a new pane",
+    )
 
 
 def slug(value: str) -> str:
@@ -520,9 +677,13 @@ def parser() -> argparse.ArgumentParser:
     sub.add_parser("hook")
     listing = sub.add_parser("list")
     listing.add_argument("--refresh", action="store_true")
-    for name in ("mark-read", "dismiss", "park", "resume"):
+    listing.add_argument("--reconcile", action="store_true")
+    for name in ("mark-read", "dismiss", "park"):
         action = sub.add_parser(name)
         action.add_argument("key")
+    resume = sub.add_parser("resume")
+    resume.add_argument("key")
+    resume.add_argument("fallback_session", nargs="?", default="")
     title = sub.add_parser("title")
     title.add_argument("key")
     title.add_argument("value")
@@ -533,6 +694,9 @@ def parser() -> argparse.ArgumentParser:
     worktree.add_argument("key")
     worktree.add_argument("branch")
     worktree.add_argument("prompt", nargs="?", default="")
+    detach = sub.add_parser("detach-pane")
+    detach.add_argument("key")
+    detach.add_argument("attachment_id")
     return result
 
 
@@ -545,6 +709,8 @@ def main() -> None:
             raise SystemExit("invalid hook JSON") from None
         handle_event(payload)
     elif args.command == "list":
+        if args.reconcile:
+            reconcile_records()
         items = records()
         if args.refresh:
             items = [enrich(item) for item in items]
@@ -560,9 +726,11 @@ def main() -> None:
     elif args.command == "park":
         do_park(lookup(args.key))
     elif args.command == "resume":
-        do_resume(lookup(args.key))
+        do_resume(lookup(args.key), args.fallback_session)
     elif args.command == "worktree":
         print(json.dumps(do_worktree(lookup(args.key), args.branch, clean(args.prompt, 2000))))
+    elif args.command == "detach-pane":
+        print(json.dumps(detach_attachment(args.key, args.attachment_id)))
 
 
 if __name__ == "__main__":

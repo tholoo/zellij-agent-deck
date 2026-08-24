@@ -16,7 +16,7 @@ _Synthetic demo with fictional sessions and task data._
 ## Requirements
 
 - Linux
-- Zellij 0.44.3
+- Zellij 0.45.0
 - Codex with lifecycle hooks enabled
 - Nix with flakes enabled (recommended build and installation path)
 
@@ -65,7 +65,13 @@ start of prompts or in commands passed to approval dialogs.
 
 Records are written with owner-only permissions to
 `${XDG_RUNTIME_DIR:-/tmp}/zellij-agent-deck-$UID` and expire after 14 days.
-Set `ZELLIJ_AGENT_DECK_STATE_DIR` to use another runtime location.
+Closed sessions leave the live deck immediately but remain available under the
+`7:resume` filter until dismissed or expired. Set
+`ZELLIJ_AGENT_DECK_STATE_DIR` to use another runtime location.
+
+The plugin listens for Zellij pane-close events and periodically reconciles its
+records with Zellij 0.45's structured pane list. This also catches force-closed
+panes and dead Zellij sessions when no Codex shutdown hook can run.
 
 ## Keys
 
@@ -76,7 +82,7 @@ Set `ZELLIJ_AGENT_DECK_STATE_DIR` to use another runtime location.
 - `p`: confirm parking with Ctrl-C; `R`: resume the Codex session
 - `m`: mark read; `d`: dismiss
 - `g`: refresh branch, dirty state, GitHub PR, and listening ports
-- `/`: search; `1`–`6`: status filters; `q`: close
+- `/`: search; `1`–`7`: status filters (`7` shows resumable sessions); `q`: close
 
 ## Codex launcher prefixes
 

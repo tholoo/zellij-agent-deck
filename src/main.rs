@@ -12,6 +12,7 @@ struct AgentRecord {
     parent_key: String,
     zellij_session: String,
     pane_id: Option<u32>,
+    attachment_id: String,
     cwd: String,
     project: String,
     project_root: String,
@@ -46,6 +47,39 @@ enum JumpAction {
     HideDeck,
     FocusTerminalPane { pane_id: u32 },
     SwitchSession { session: String, pane_id: u32 },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct DetachRequest {
+    key: String,
+    attachment_id: String,
+}
+
+fn is_attached(agent: &AgentRecord) -> bool {
+    agent.pane_id.is_some() && !agent.zellij_session.is_empty()
+}
+
+fn is_resumable(agent: &AgentRecord) -> bool {
+    !is_attached(agent) && agent.kind != "subagent" && !agent.codex_session_id.is_empty()
+}
+
+fn detach_requests_for_closed_pane(
+    current_session: &str,
+    pane_id: u32,
+    agents: &[AgentRecord],
+) -> Vec<DetachRequest> {
+    agents
+        .iter()
+        .filter(|agent| {
+            agent.zellij_session == current_session
+                && agent.pane_id == Some(pane_id)
+                && !agent.attachment_id.is_empty()
+        })
+        .map(|agent| DetachRequest {
+            key: agent.key.clone(),
+            attachment_id: agent.attachment_id.clone(),
+        })
+        .collect()
 }
 
 fn jump_plan(current_session: &str, agent: &AgentRecord) -> Result<Vec<JumpAction>, &'static str> {
@@ -90,7 +124,9 @@ struct AgentDeck {
     applied_list_request: u64,
 }
 
-const FILTERS: [&str; 6] = ["all", "unread", "running", "waiting", "done", "parked"];
+const FILTERS: [&str; 7] = [
+    "live", "unread", "running", "waiting", "done", "parked", "resume",
+];
 
 impl AgentDeck {
     fn required_permissions() -> [PermissionType; 4] {
@@ -99,6 +135,18 @@ impl AgentDeck {
             PermissionType::ChangeApplicationState,
             PermissionType::RunCommands,
             PermissionType::ReadSessionEnvironmentVariables,
+        ]
+    }
+
+    fn subscribed_events() -> [EventType; 7] {
+        [
+            EventType::Key,
+            EventType::Mouse,
+            EventType::Visible,
+            EventType::Timer,
+            EventType::RunCommandResult,
+            EventType::PermissionRequestResult,
+            EventType::PaneClosed,
         ]
     }
 
@@ -120,13 +168,16 @@ impl AgentDeck {
         run_command(&refs, context);
     }
 
-    fn refresh(&mut self, enrich: bool) {
+    fn refresh(&mut self, enrich: bool, reconcile: bool) {
         if !self.permissions_granted {
             return;
         }
         let mut args = vec!["list".to_owned()];
         if enrich {
             args.push("--refresh".to_owned());
+        }
+        if reconcile {
+            args.push("--reconcile".to_owned());
         }
         self.next_list_request = self.next_list_request.wrapping_add(1);
         let mut context = Self::context("list");
@@ -136,12 +187,13 @@ impl AgentDeck {
 
     fn matches_filter(&self, agent: &AgentRecord) -> bool {
         match self.filter {
-            1 => agent.unread,
-            2 => agent.status == "working" || agent.status == "idle",
-            3 => agent.status == "needs_input",
-            4 => agent.status == "done" || agent.status == "ended",
-            5 => agent.status == "parked",
-            _ => true,
+            1 => is_attached(agent) && agent.unread,
+            2 => is_attached(agent) && (agent.status == "working" || agent.status == "idle"),
+            3 => is_attached(agent) && agent.status == "needs_input",
+            4 => is_attached(agent) && agent.status == "done",
+            5 => is_attached(agent) && agent.status == "parked",
+            6 => is_resumable(agent),
+            _ => is_attached(agent),
         }
     }
 
@@ -252,7 +304,7 @@ impl AgentDeck {
         self.clamp_selection();
         if self.permissions_granted {
             self.sync_agent_pane(&agent);
-            self.refresh(false);
+            self.refresh(false, false);
             self.applied_list_request = self.next_list_request;
         }
     }
@@ -272,6 +324,34 @@ impl AgentDeck {
         }
     }
 
+    fn handle_closed_pane(&mut self, pane_id: u32) {
+        let requests =
+            detach_requests_for_closed_pane(&self.current_session, pane_id, &self.agents);
+        for request in &requests {
+            self.run_helper(
+                "detach-pane",
+                &[
+                    "detach-pane".into(),
+                    request.key.clone(),
+                    request.attachment_id.clone(),
+                ],
+            );
+        }
+        for agent in &mut self.agents {
+            if requests.iter().any(|request| {
+                request.key == agent.key && request.attachment_id == agent.attachment_id
+            }) {
+                agent.pane_id = None;
+                agent.attachment_id.clear();
+                if agent.status != "parked" {
+                    agent.status = "ended".into();
+                }
+                agent.unread = false;
+            }
+        }
+        self.clamp_selection();
+    }
+
     fn activate_after_permissions_granted(&mut self) {
         self.permissions_granted = true;
         self.current_session = get_session_environment_variables()
@@ -281,7 +361,7 @@ impl AgentDeck {
             self.sync_agent_pane(agent);
         }
         set_timeout(3.0);
-        self.refresh(false);
+        self.refresh(false, true);
         hide_self();
     }
 
@@ -366,18 +446,21 @@ impl AgentDeck {
                     self.mode = InputMode::ConfirmPark;
                     self.notice = "Park selected agent with Ctrl-C? y/n".into();
                 }
-                BareKey::Char('R') => self.mutate_selected("resume", &[]),
+                BareKey::Char('R') => {
+                    let fallback_session = self.current_session.clone();
+                    self.mutate_selected("resume", &[fallback_session]);
+                }
                 BareKey::Char('m') => self.mutate_selected("mark-read", &[]),
                 BareKey::Char('d') => self.mutate_selected("dismiss", &[]),
                 BareKey::Char('g') => {
                     self.notice = "Refreshing git, PR, and port metadata…".into();
-                    self.refresh(true);
+                    self.refresh(true, true);
                 }
                 BareKey::Char('c') => {
                     self.staged.clear();
                     self.notice.clear();
                 }
-                BareKey::Char(ch @ '1'..='6') => {
+                BareKey::Char(ch @ '1'..='7') => {
                     self.filter = ch as usize - '1' as usize;
                     self.selected = 0;
                 }
@@ -427,7 +510,7 @@ impl AgentDeck {
         } else if operation != "list" {
             if code.unwrap_or(1) == 0 {
                 self.notice = format!("{operation} complete");
-                self.refresh(false);
+                self.refresh(false, false);
             } else {
                 let message = String::from_utf8_lossy(&stderr);
                 self.notice = truncate(&format!("{operation} failed: {}", message.trim()), 120);
@@ -442,14 +525,7 @@ impl ZellijPlugin for AgentDeck {
             .get("helper")
             .cloned()
             .unwrap_or_else(|| "zellij-agent-deck".into());
-        subscribe(&[
-            EventType::Key,
-            EventType::Mouse,
-            EventType::Visible,
-            EventType::Timer,
-            EventType::RunCommandResult,
-            EventType::PermissionRequestResult,
-        ]);
+        subscribe(&Self::subscribed_events());
         set_selectable(true);
         request_permission(&Self::required_permissions());
     }
@@ -476,13 +552,17 @@ impl ZellijPlugin for AgentDeck {
             Event::Visible(visible) => {
                 self.visible = visible;
                 if visible {
-                    self.refresh(false);
+                    self.refresh(false, true);
                 }
             }
             Event::Timer(_) => {
                 self.refresh_ticks = self.refresh_ticks.wrapping_add(1);
-                self.refresh(false);
+                self.refresh(false, self.refresh_ticks.is_multiple_of(10));
                 set_timeout(3.0);
+            }
+            Event::PaneClosed(PaneId::Terminal(pane_id)) => {
+                self.handle_closed_pane(pane_id);
+                return true;
             }
             Event::RunCommandResult(code, stdout, stderr, context) => {
                 self.handle_result(code, stdout, stderr, context);
@@ -516,18 +596,30 @@ impl ZellijPlugin for AgentDeck {
 
     fn render(&mut self, rows: usize, cols: usize) {
         let width = cols.saturating_sub(2);
-        let unread = self.agents.iter().filter(|agent| agent.unread).count();
+        let live = self
+            .agents
+            .iter()
+            .filter(|agent| is_attached(agent))
+            .count();
+        let resumable = self
+            .agents
+            .iter()
+            .filter(|agent| is_resumable(agent))
+            .count();
+        let unread = self
+            .agents
+            .iter()
+            .filter(|agent| is_attached(agent) && agent.unread)
+            .count();
         let waiting = self
             .agents
             .iter()
-            .filter(|agent| agent.status == "needs_input")
+            .filter(|agent| is_attached(agent) && agent.status == "needs_input")
             .count();
         let header = truncate(
             &format!(
-                " Agent Deck  {} agents · {} unread · {} waiting",
-                self.agents.len(),
-                unread,
-                waiting
+                " Agent Deck  {} live · {} resume · {} unread · {} waiting",
+                live, resumable, unread, waiting
             ),
             width,
         );
@@ -809,5 +901,70 @@ mod tests {
                 },
             ])
         );
+    }
+
+    #[test]
+    fn live_filter_hides_detached_sessions_and_resume_filter_restores_them() {
+        let mut deck = AgentDeck {
+            agents: vec![
+                AgentRecord {
+                    key: "codex:live".into(),
+                    zellij_session: "work".into(),
+                    pane_id: Some(7),
+                    ..Default::default()
+                },
+                AgentRecord {
+                    key: "codex:resume".into(),
+                    codex_session_id: "session-id".into(),
+                    pane_id: None,
+                    ..Default::default()
+                },
+                AgentRecord {
+                    key: "subagent:hidden".into(),
+                    kind: "subagent".into(),
+                    codex_session_id: "session-id".into(),
+                    pane_id: None,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(deck.matching_indices(), vec![0]);
+        deck.filter = 6;
+        assert_eq!(deck.matching_indices(), vec![1]);
+    }
+
+    #[test]
+    fn pane_close_detaches_only_the_matching_attachment_generation() {
+        let agents = vec![
+            AgentRecord {
+                key: "codex:closed".into(),
+                zellij_session: "work".into(),
+                pane_id: Some(7),
+                attachment_id: "generation-a".into(),
+                ..Default::default()
+            },
+            AgentRecord {
+                key: "codex:other-session".into(),
+                zellij_session: "other".into(),
+                pane_id: Some(7),
+                attachment_id: "generation-b".into(),
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(
+            detach_requests_for_closed_pane("work", 7, &agents),
+            vec![DetachRequest {
+                key: "codex:closed".into(),
+                attachment_id: "generation-a".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn plugin_subscribes_to_pane_close_events() {
+        assert!(AgentDeck::subscribed_events().contains(&EventType::PaneClosed));
     }
 }
