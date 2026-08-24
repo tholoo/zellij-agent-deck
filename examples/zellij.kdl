@@ -1,6 +1,7 @@
 plugins {
     agent-deck location="file:~/.nix-profile/share/zellij/plugins/agent-deck.wasm" {
         helper "zellij-agent-deck"
+        show_subagents "false"
     }
 }
 

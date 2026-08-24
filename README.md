@@ -67,6 +67,10 @@ your Zellij configuration. Update the plugin path if it is not installed in
 your Nix profile. The configuration loads one hidden plugin instance in each
 session and binds `Alt a` to show or focus the floating deck.
 
+Subagents are hidden by default. Set `show_subagents "true"` in the
+`agent-deck` plugin configuration to show them initially. They are grouped
+beneath their parent session with tree connectors when visible.
+
 ## Configure Codex hooks
 
 Copy [`examples/hooks.json`](examples/hooks.json) to `~/.codex/hooks.json`, or
@@ -103,6 +107,7 @@ panes and dead Zellij sessions when no Codex shutdown hook can run.
 - `p`: confirm parking with Ctrl-C; `R`: resume the Codex session
 - `m`: mark read; `d`: dismiss
 - `g`: refresh branch, dirty state, GitHub PR, and listening ports
+- `s`: show or hide subagents for the current plugin instance
 - `/`: search; `1`–`7`: status filters (`7` shows resumable sessions); `q`: close
 
 ## Codex launcher prefixes

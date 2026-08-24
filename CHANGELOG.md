@@ -7,6 +7,8 @@ is based on Keep a Changelog, and the project follows Semantic Versioning.
 
 ### Added
 
+- Default-off subagent visibility with a runtime toggle, plugin configuration,
+  and nested tree rendering beneath parent Codex sessions.
 - Synthetic Agent Deck screenshot for the project documentation.
 - Exact Codex session resurrection for plain Codex commands serialized by
   Zellij, including exit cleanup plus reference-aware and age-based garbage

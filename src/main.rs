@@ -112,12 +112,20 @@ struct DeckModel {
     selected: usize,
     filter: usize,
     query: String,
+    show_subagents: bool,
     viewport_start: usize,
     viewport_len: usize,
 }
 
 impl DeckModel {
+    fn includes_kind(&self, agent: &AgentRecord) -> bool {
+        self.show_subagents || agent.kind != "subagent"
+    }
+
     fn matches_filter(&self, agent: &AgentRecord) -> bool {
+        if !self.includes_kind(agent) {
+            return false;
+        }
         match self.filter {
             1 => is_attached(agent) && agent.unread,
             2 => is_attached(agent) && (agent.status == "working" || agent.status == "idle"),
@@ -131,7 +139,8 @@ impl DeckModel {
 
     fn matching_indices(&self, live_query: Option<&str>) -> Vec<usize> {
         let query = live_query.unwrap_or(&self.query).to_lowercase();
-        self.agents
+        let included = self
+            .agents
             .iter()
             .enumerate()
             .filter(|(_, agent)| {
@@ -145,7 +154,34 @@ impl DeckModel {
                         .contains(&query))
             })
             .map(|(index, _)| index)
-            .collect()
+            .collect::<Vec<_>>();
+        if !self.show_subagents {
+            return included;
+        }
+
+        let mut ordered = Vec::with_capacity(included.len());
+        let mut emitted = vec![false; self.agents.len()];
+        for parent_index in included.iter().copied() {
+            let parent = &self.agents[parent_index];
+            if parent.kind == "subagent" {
+                continue;
+            }
+            ordered.push(parent_index);
+            emitted[parent_index] = true;
+            for child_index in included.iter().copied().filter(|child_index| {
+                let child = &self.agents[*child_index];
+                child.kind == "subagent" && child.parent_key == parent.key
+            }) {
+                ordered.push(child_index);
+                emitted[child_index] = true;
+            }
+        }
+        for index in included {
+            if !emitted[index] {
+                ordered.push(index);
+            }
+        }
+        ordered
     }
 
     fn selected_agent(&self, live_query: Option<&str>) -> Option<AgentRecord> {
@@ -181,6 +217,11 @@ impl DeckModel {
 
     fn clear_query(&mut self) {
         self.set_query(String::new());
+    }
+
+    fn toggle_subagents(&mut self) {
+        self.show_subagents = !self.show_subagents;
+        self.selected = 0;
     }
 
     fn update_viewport(&mut self, list_height: usize, matching_len: usize) {
@@ -518,6 +559,17 @@ impl AgentDeck {
                     self.model.clear_query();
                     self.notice.clear();
                 }
+                BareKey::Char('s') => {
+                    self.model.toggle_subagents();
+                    self.notice = format!(
+                        "Subagents {}",
+                        if self.model.show_subagents {
+                            "shown"
+                        } else {
+                            "hidden"
+                        }
+                    );
+                }
                 BareKey::Char(ch @ '1'..='7') => {
                     self.model.set_filter(ch as usize - '1' as usize);
                 }
@@ -582,6 +634,9 @@ impl ZellijPlugin for AgentDeck {
             .get("helper")
             .cloned()
             .unwrap_or_else(|| "zellij-agent-deck".into());
+        self.model.show_subagents = configuration
+            .get("show_subagents")
+            .is_some_and(|value| parse_bool(value));
         subscribe(&Self::subscribed_events());
         set_selectable(true);
         request_permission(&Self::required_permissions());
@@ -657,7 +712,7 @@ impl ZellijPlugin for AgentDeck {
             .model
             .agents
             .iter()
-            .filter(|agent| is_attached(agent))
+            .filter(|agent| self.model.includes_kind(agent) && is_attached(agent))
             .count();
         let resumable = self
             .model
@@ -669,13 +724,17 @@ impl ZellijPlugin for AgentDeck {
             .model
             .agents
             .iter()
-            .filter(|agent| is_attached(agent) && agent.unread)
+            .filter(|agent| self.model.includes_kind(agent) && is_attached(agent) && agent.unread)
             .count();
         let waiting = self
             .model
             .agents
             .iter()
-            .filter(|agent| is_attached(agent) && agent.status == "needs_input")
+            .filter(|agent| {
+                self.model.includes_kind(agent)
+                    && is_attached(agent)
+                    && agent.status == "needs_input"
+            })
             .count();
         let header = truncate(
             &format!(
@@ -698,6 +757,15 @@ impl ZellijPlugin for AgentDeck {
             })
             .collect::<Vec<_>>()
             .join(" ");
+        let filters = format!(
+            "{} · subagents:{}",
+            filters,
+            if self.model.show_subagents {
+                "on"
+            } else {
+                "off"
+            }
+        );
         print_text_with_coordinates(
             Text::new(truncate(&filters, width)).dim_all(),
             1,
@@ -720,12 +788,21 @@ impl ZellijPlugin for AgentDeck {
                 " "
             };
             let unread_mark = if agent.unread { "●" } else { " " };
-            let kind = if agent.kind == "subagent" { "↳" } else { " " };
             let state = status_symbol(&agent.status);
-            let label = format!(
-                "{cursor}{unread_mark}{state}{kind} {}: {}",
-                agent.project, agent.title
-            );
+            let position = scroll + screen_index;
+            let label = if let Some(connector) =
+                subagent_connector(&self.model.agents, &matching, position)
+            {
+                format!(
+                    "{cursor}{unread_mark}{state}  {connector} subagent: {}",
+                    agent.title
+                )
+            } else {
+                format!(
+                    "{cursor}{unread_mark}{state}  {}: {}",
+                    agent.project, agent.title
+                )
+            };
             let text = Text::new(truncate(&label, width));
             let text = if scroll + screen_index == self.model.selected {
                 text.color_all(3)
@@ -794,7 +871,7 @@ impl ZellijPlugin for AgentDeck {
             Some(width),
             None,
         );
-        let keys = " Enter jump · r reply · t title · w worktree · p park · R resume · m read · d dismiss · g refresh · / search · q close ";
+        let keys = " Enter jump · r reply · t title · w worktree · p park · R resume · m read · d dismiss · g refresh · s subagents · / search · q close ";
         print_text_with_coordinates(
             Text::new(truncate(keys, width)).dim_all(),
             1,
@@ -814,6 +891,31 @@ fn status_symbol(status: &str) -> &'static str {
         "ended" => "×",
         _ => "○",
     }
+}
+
+fn parse_bool(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "on" | "true" | "yes"
+    )
+}
+
+fn subagent_connector(
+    agents: &[AgentRecord],
+    matching: &[usize],
+    position: usize,
+) -> Option<&'static str> {
+    let agent = matching
+        .get(position)
+        .and_then(|index| agents.get(*index))?;
+    if agent.kind != "subagent" {
+        return None;
+    }
+    let has_next_sibling = matching
+        .get(position + 1)
+        .and_then(|index| agents.get(*index))
+        .is_some_and(|next| next.kind == "subagent" && next.parent_key == agent.parent_key);
+    Some(if has_next_sibling { "├─" } else { "└─" })
 }
 
 fn truncate(value: &str, limit: usize) -> String {
@@ -857,6 +959,16 @@ mod tests {
     fn status_symbols_are_distinct() {
         assert_ne!(status_symbol("working"), status_symbol("needs_input"));
         assert_ne!(status_symbol("done"), status_symbol("parked"));
+    }
+
+    #[test]
+    fn plugin_boolean_configuration_is_explicit_and_default_safe() {
+        for enabled in ["true", "TRUE", "1", "yes", "on"] {
+            assert!(parse_bool(enabled));
+        }
+        for disabled in ["false", "0", "no", "off", "unexpected", ""] {
+            assert!(!parse_bool(disabled));
+        }
     }
 
     #[test]
@@ -998,6 +1110,56 @@ mod tests {
         assert_eq!(deck.matching_indices(), vec![0]);
         deck.model.set_filter(6);
         assert_eq!(deck.matching_indices(), vec![1]);
+    }
+
+    #[test]
+    fn subagents_are_hidden_by_default_and_nested_when_enabled() {
+        let mut model = DeckModel {
+            agents: vec![
+                AgentRecord {
+                    key: "subagent:parent:first".into(),
+                    kind: "subagent".into(),
+                    parent_key: "codex:parent".into(),
+                    zellij_session: "work".into(),
+                    pane_id: Some(7),
+                    ..Default::default()
+                },
+                AgentRecord {
+                    key: "codex:parent".into(),
+                    zellij_session: "work".into(),
+                    pane_id: Some(7),
+                    ..Default::default()
+                },
+                AgentRecord {
+                    key: "subagent:parent:last".into(),
+                    kind: "subagent".into(),
+                    parent_key: "codex:parent".into(),
+                    zellij_session: "work".into(),
+                    pane_id: Some(7),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(model.matching_indices(None), vec![1]);
+
+        model.toggle_subagents();
+        let matching = model.matching_indices(None);
+        assert_eq!(matching, vec![1, 0, 2]);
+        assert_eq!(subagent_connector(&model.agents, &matching, 0), None);
+        assert_eq!(subagent_connector(&model.agents, &matching, 1), Some("├─"));
+        assert_eq!(subagent_connector(&model.agents, &matching, 2), Some("└─"));
+    }
+
+    #[test]
+    fn subagent_key_toggles_visibility() {
+        let mut deck = AgentDeck::default();
+
+        deck.handle_key(KeyWithModifier::new(BareKey::Char('s')));
+
+        assert!(deck.model.show_subagents);
+        assert_eq!(deck.notice, "Subagents shown");
     }
 
     #[test]
