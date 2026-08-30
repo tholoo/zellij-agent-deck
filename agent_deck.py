@@ -144,7 +144,11 @@ class RecordStore:
     @staticmethod
     def _migrate(record: dict[str, Any]) -> bool:
         migrated = False
-        if (
+        if record.get("kind") == "internal" and not record.get("dismissed"):
+            record["dismissed"] = True
+            record["unread"] = False
+            migrated = True
+        elif (
             record.get("kind") == "codex"
             and str(record.get("model") or "").endswith("-luna")
             and is_title_generation_prompt(record.get("title"))
@@ -591,11 +595,10 @@ def handle_event(payload: dict[str, Any]) -> dict[str, Any]:
     title_helper_prompt = event == "UserPromptSubmit" and is_title_generation_prompt(
         payload.get("prompt")
     )
-    title_helper = title_helper_prompt or bool(existing and existing.get("kind") == "internal")
     title_parent_key = str(existing.get("parent_key") or "") if existing else ""
     if title_helper_prompt and not title_parent_key:
         title_parent_key = title_generation_parent_key(session_id, zellij_session, current_pane)
-    native_title = "" if title_helper or is_subagent else codex_thread_titles().get(session_id, "")
+    native_title = "" if is_subagent else codex_thread_titles().get(session_id, "")
     fallback_cwd = existing.get("cwd") if existing else ""
     cwd = clean(payload.get("cwd") or fallback_cwd or os.getcwd(), 512)
     refresh_metadata = existing is None or event in {
@@ -613,6 +616,11 @@ def handle_event(payload: dict[str, Any]) -> dict[str, Any]:
     message = event_message(payload, event)
 
     def transition(record: dict[str, Any]) -> dict[str, Any]:
+        # Hook processes can overlap. Re-check permanent helper state from the
+        # record read under the store lock instead of relying on `existing`,
+        # which may have been read before the prompt hook classified it.
+        record_is_title_helper = title_helper_prompt or record.get("kind") == "internal"
+        record_title_parent_key = title_parent_key or str(record.get("parent_key") or "")
         # Pane/session can change after a resume, so hook environment always wins.
         previous_session = record.get("zellij_session")
         previous_pane = record.get("pane_id")
@@ -641,9 +649,9 @@ def handle_event(payload: dict[str, Any]) -> dict[str, Any]:
             record["model"] = clean(payload["model"], 64)
         record["dismissed"] = False
 
-        if title_helper:
+        if record_is_title_helper:
             record["kind"] = "internal"
-            record["parent_key"] = title_parent_key
+            record["parent_key"] = record_title_parent_key
             record["dismissed"] = True
 
         if is_subagent:
@@ -651,7 +659,7 @@ def handle_event(payload: dict[str, Any]) -> dict[str, Any]:
             if not record.get("title_locked"):
                 record["title"] = clean(payload.get("agent_type") or "subagent", TITLE_LIMIT)
 
-        if title_helper:
+        if record_is_title_helper:
             record["status"] = "ended" if event in {"Stop", "SessionEnd"} else "working"
             record["unread"] = False
             record["message"] = ""
@@ -682,18 +690,18 @@ def handle_event(payload: dict[str, Any]) -> dict[str, Any]:
             record["status"] = "idle"
             record["unread"] = False
 
-        if native_title and not record.get("title_locked"):
+        if native_title and not record_is_title_helper and not record.get("title_locked"):
             record["title"] = native_title
 
-        if message and not title_helper:
+        if message and not record_is_title_helper:
             record["message"] = message
         record["updated_at"] = now()
         return record
 
     record = RECORDS.update(key, transition, initial)
     pipe_event(record)
-    if title_helper and event in {"Stop", "SessionEnd"}:
-        apply_generated_title(title_parent_key, generated_title(payload))
+    if record.get("kind") == "internal" and event in {"Stop", "SessionEnd"}:
+        apply_generated_title(str(record.get("parent_key") or ""), generated_title(payload))
     if event == "SessionEnd":
         detach_session_records(session_id, excluding_key=key)
     return record

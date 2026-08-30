@@ -25,7 +25,8 @@ is based on Keep a Changelog, and the project follows Semantic Versioning.
 
 ### Fixed
 
-- Hide Codex's internal automatic title-generation session from the agent list.
+- Hide Codex's internal automatic title-generation session from the agent list,
+  including overlapping hook events and previously leaked helper records.
 - Hide the floating deck before jumping to a selected Codex pane.
 - Request session-environment access before reading the Zellij session name,
   preventing a permission denial from trapping the plugin during startup.
