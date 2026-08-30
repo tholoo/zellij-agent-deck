@@ -71,6 +71,11 @@ Subagents are hidden by default. Set `show_subagents "true"` in the
 `agent-deck` plugin configuration to show them initially. They are grouped
 beneath their parent session with tree connectors when visible.
 
+With Codex 0.150 or newer, the deck uses Codex's generated thread name as the
+task title. The first prompt remains a temporary fallback while generation is
+in progress. Codex's internal title-generation session is hidden from the
+agent list, and a title set with `t` continues to override automatic names.
+
 ## Configure Codex hooks
 
 Copy [`examples/hooks.json`](examples/hooks.json) to `~/.codex/hooks.json`, or
@@ -83,8 +88,9 @@ in Codex after adding or changing the file, inspect the command, and trust it.
 ## Privacy and local state
 
 The deck never writes complete prompts or transcripts. To make the inbox
-useful, it does store bounded excerpts: a normalized task title (up to 72
-characters), status details (up to 180 characters), paths, Zellij/Codex
+useful, it does store bounded excerpts: the Codex-generated thread name (or a
+normalized first-prompt fallback while no name is available) up to 72
+characters, status details (up to 180 characters), paths, Zellij/Codex
 identifiers, launcher commands, and Git metadata. Do not put secrets at the
 start of prompts or in commands passed to approval dialogs.
 

@@ -19,6 +19,7 @@ struct AgentRecord {
     title: String,
     status: String,
     unread: bool,
+    dismissed: bool,
     message: String,
     model: String,
     branch: String,
@@ -60,7 +61,7 @@ fn is_attached(agent: &AgentRecord) -> bool {
 }
 
 fn is_resumable(agent: &AgentRecord) -> bool {
-    !is_attached(agent) && agent.kind != "subagent" && !agent.codex_session_id.is_empty()
+    !is_attached(agent) && agent.kind == "codex" && !agent.codex_session_id.is_empty()
 }
 
 fn detach_requests_for_closed_pane(
@@ -119,7 +120,7 @@ struct DeckModel {
 
 impl DeckModel {
     fn includes_kind(&self, agent: &AgentRecord) -> bool {
-        self.show_subagents || agent.kind != "subagent"
+        !agent.dismissed && (self.show_subagents || agent.kind != "subagent")
     }
 
     fn matches_filter(&self, agent: &AgentRecord) -> bool {
@@ -388,6 +389,17 @@ impl AgentDeck {
     }
 
     fn apply_agent_signal(&mut self, agent: AgentRecord) {
+        if agent.dismissed {
+            self.model
+                .agents
+                .retain(|existing| existing.key != agent.key);
+            self.clamp_selection();
+            if self.permissions_granted {
+                self.refresh(false, false);
+                self.applied_list_request = self.next_list_request;
+            }
+            return;
+        }
         if let Some(existing) = self
             .model
             .agents
@@ -1014,6 +1026,28 @@ mod tests {
     }
 
     #[test]
+    fn dismissed_agent_signal_removes_an_existing_agent_immediately() {
+        let mut deck = AgentDeck {
+            model: DeckModel {
+                agents: vec![AgentRecord {
+                    key: "codex:internal".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        deck.apply_agent_signal(AgentRecord {
+            key: "codex:internal".into(),
+            dismissed: true,
+            ..Default::default()
+        });
+
+        assert!(deck.model.agents.is_empty());
+    }
+
+    #[test]
     fn jump_within_current_session_focuses_the_terminal_pane() {
         let agent = AgentRecord {
             key: "codex:example".into(),
@@ -1090,6 +1124,7 @@ mod tests {
                     },
                     AgentRecord {
                         key: "codex:resume".into(),
+                        kind: "codex".into(),
                         codex_session_id: "session-id".into(),
                         pane_id: None,
                         ..Default::default()

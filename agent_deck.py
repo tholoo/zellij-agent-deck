@@ -33,12 +33,17 @@ PREFIX_ARG_LIMIT = 16
 PREFIX_ARG_LENGTH = 256
 RECONCILE_INTERVAL = 5
 HOOK_GIT_TIMEOUT = 0.5
+TITLE_GENERATION_PROMPT = "Generate a concise, single-line task title of at most 36 characters"
 
 
 def clean(value: Any, limit: int) -> str:
     text = CONTROL.sub("", str(value or "")).replace("\r", " ").replace("\n", " ")
     text = " ".join(text.split())
     return text[:limit]
+
+
+def is_title_generation_prompt(value: Any) -> bool:
+    return clean(value, 256).startswith(TITLE_GENERATION_PROMPT)
 
 
 def now() -> int:
@@ -139,6 +144,15 @@ class RecordStore:
     @staticmethod
     def _migrate(record: dict[str, Any]) -> bool:
         migrated = False
+        if (
+            record.get("kind") == "codex"
+            and str(record.get("model") or "").endswith("-luna")
+            and is_title_generation_prompt(record.get("title"))
+        ):
+            record["kind"] = "internal"
+            record["dismissed"] = True
+            record["unread"] = False
+            migrated = True
         if record.get("status") == "ended" and record.get("pane_id") is not None:
             record["pane_id"] = None
             record["attachment_id"] = ""
@@ -242,8 +256,30 @@ def record_path(key: str) -> Path:
     return RECORDS.path(key)
 
 
+def title_transition(title: str) -> Callable[[dict[str, Any]], dict[str, Any]]:
+    def transition(record: dict[str, Any]) -> dict[str, Any]:
+        record["title"] = title
+        return record
+
+    return transition
+
+
 def records(include_dismissed: bool = False) -> list[dict[str, Any]]:
-    return RECORDS.list(include_dismissed)
+    items = RECORDS.list(include_dismissed)
+    native_titles = codex_thread_titles()
+    result = []
+    for item in items:
+        native_title = native_titles.get(str(item.get("codex_session_id") or ""))
+        if (
+            native_title
+            and item.get("kind") == "codex"
+            and not item.get("title_locked")
+            and item.get("title") != native_title
+        ):
+            item = RECORDS.update(item["key"], title_transition(native_title))
+        if include_dismissed or not item.get("dismissed"):
+            result.append(item)
+    return result
 
 
 def run(
@@ -295,6 +331,40 @@ def derive_title(prompt: Any) -> str:
     title = clean(prompt, TITLE_LIMIT)
     title = re.sub(r"^(please\s+|can you\s+|could you\s+|would you\s+)", "", title, flags=re.I)
     return title.rstrip(" .") or "Codex session"
+
+
+def codex_thread_titles() -> dict[str, str]:
+    """Read Codex's append-only index; the last name for a thread wins."""
+    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+    try:
+        lines = (codex_home / "session_index.jsonl").read_text().splitlines()
+    except OSError:
+        return {}
+    titles: dict[str, str] = {}
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
+            continue
+        title = clean(entry.get("thread_name"), TITLE_LIMIT)
+        if title:
+            titles[entry["id"]] = title
+    return titles
+
+
+def generated_title(payload: dict[str, Any]) -> str:
+    candidate = payload.get("last_assistant_message")
+    if not isinstance(candidate, str):
+        return ""
+    try:
+        decoded = json.loads(candidate)
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(decoded, dict):
+        return ""
+    return clean(decoded.get("title"), TITLE_LIMIT)
 
 
 def pane_number(value: Any) -> int | None:
@@ -438,6 +508,53 @@ def event_message(payload: dict[str, Any], event: str) -> str:
     return ""
 
 
+def title_generation_parent_key(session_id: str, zellij_session: str, pane_id: int | None) -> str:
+    for variable in ("CODEX_THREAD_ID", "CODEX_SESSION_ID"):
+        parent_id = clean(os.environ.get(variable), 128)
+        if parent_id and parent_id != session_id:
+            key = f"codex:{parent_id}"
+            parent = RECORDS.get(key)
+            if parent and parent.get("kind") == "codex" and not parent.get("dismissed"):
+                return key
+
+    candidates = [
+        record
+        for record in RECORDS.list(include_dismissed=True)
+        if record.get("kind") == "codex"
+        and not record.get("dismissed")
+        and record.get("codex_session_id") != session_id
+        and record.get("zellij_session") == zellij_session
+        and record.get("pane_id") == pane_id
+    ]
+    if not candidates:
+        return ""
+    parent = max(
+        candidates,
+        key=lambda record: (
+            record.get("status") in {"working", "idle", "needs_input"},
+            record.get("updated_at", 0),
+            record.get("started_at", 0),
+        ),
+    )
+    return str(parent.get("key") or "")
+
+
+def apply_generated_title(parent_key: str, fallback_title: str = "") -> dict[str, Any] | None:
+    if not parent_key:
+        return None
+    parent = RECORDS.get(parent_key)
+    if not parent:
+        return None
+    native_title = codex_thread_titles().get(str(parent.get("codex_session_id") or ""))
+    title = native_title or clean(fallback_title, TITLE_LIMIT)
+    if not title or parent.get("title_locked") or parent.get("title") == title:
+        return parent
+
+    updated = RECORDS.update(parent_key, lambda current: {**current, "title": title})
+    pipe_event(updated)
+    return updated
+
+
 def pipe_event(record: dict[str, Any]) -> None:
     if not record.get("zellij_session") or not shutil.which("zellij"):
         return
@@ -471,6 +588,14 @@ def handle_event(payload: dict[str, Any]) -> dict[str, Any]:
     existing = RECORDS.get(key)
     zellij_session = clean(os.environ.get("ZELLIJ_SESSION_NAME"), 128)
     current_pane = pane_number(os.environ.get("ZELLIJ_PANE_ID"))
+    title_helper_prompt = event == "UserPromptSubmit" and is_title_generation_prompt(
+        payload.get("prompt")
+    )
+    title_helper = title_helper_prompt or bool(existing and existing.get("kind") == "internal")
+    title_parent_key = str(existing.get("parent_key") or "") if existing else ""
+    if title_helper_prompt and not title_parent_key:
+        title_parent_key = title_generation_parent_key(session_id, zellij_session, current_pane)
+    native_title = "" if title_helper or is_subagent else codex_thread_titles().get(session_id, "")
     fallback_cwd = existing.get("cwd") if existing else ""
     cwd = clean(payload.get("cwd") or fallback_cwd or os.getcwd(), 512)
     refresh_metadata = existing is None or event in {
@@ -516,12 +641,24 @@ def handle_event(payload: dict[str, Any]) -> dict[str, Any]:
             record["model"] = clean(payload["model"], 64)
         record["dismissed"] = False
 
+        if title_helper:
+            record["kind"] = "internal"
+            record["parent_key"] = title_parent_key
+            record["dismissed"] = True
+
         if is_subagent:
             record["parent_key"] = f"codex:{session_id}"
             if not record.get("title_locked"):
                 record["title"] = clean(payload.get("agent_type") or "subagent", TITLE_LIMIT)
 
-        if event == "UserPromptSubmit":
+        if title_helper:
+            record["status"] = "ended" if event in {"Stop", "SessionEnd"} else "working"
+            record["unread"] = False
+            record["message"] = ""
+            if event in {"Stop", "SessionEnd"}:
+                record["pane_id"] = None
+                record["attachment_id"] = ""
+        elif event == "UserPromptSubmit":
             record["status"] = "working"
             record["unread"] = False
             record["message"] = ""
@@ -545,13 +682,18 @@ def handle_event(payload: dict[str, Any]) -> dict[str, Any]:
             record["status"] = "idle"
             record["unread"] = False
 
-        if message:
+        if native_title and not record.get("title_locked"):
+            record["title"] = native_title
+
+        if message and not title_helper:
             record["message"] = message
         record["updated_at"] = now()
         return record
 
     record = RECORDS.update(key, transition, initial)
     pipe_event(record)
+    if title_helper and event in {"Stop", "SessionEnd"}:
+        apply_generated_title(title_parent_key, generated_title(payload))
     if event == "SessionEnd":
         detach_session_records(session_id, excluding_key=key)
     return record

@@ -7,6 +7,8 @@ is based on Keep a Changelog, and the project follows Semantic Versioning.
 
 ### Added
 
+- Codex 0.150 generated thread names as Agent Deck titles, while preserving
+  prompt-derived fallbacks and manual title overrides.
 - Default-off subagent visibility with a runtime toggle, plugin configuration,
   and nested tree rendering beneath parent Codex sessions.
 - Synthetic Agent Deck screenshot for the project documentation.
@@ -23,6 +25,7 @@ is based on Keep a Changelog, and the project follows Semantic Versioning.
 
 ### Fixed
 
+- Hide Codex's internal automatic title-generation session from the agent list.
 - Hide the floating deck before jumping to a selected Codex pane.
 - Request session-environment access before reading the Zellij session name,
   preventing a permission denial from trapping the plugin during startup.
