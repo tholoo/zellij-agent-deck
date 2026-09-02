@@ -88,6 +88,18 @@ class AgentDeckTest(unittest.TestCase):
         self.assertEqual(detached["attachment_id"], "")
         self.assertEqual(detached["status"], "ended")
 
+    def test_clear_detaches_the_previous_session_in_the_same_pane(self):
+        previous = self.event("SessionStart")
+
+        current = self.event("SessionStart", session_id="def", source="clear")
+        stored_previous = deck.lookup(previous["key"])
+
+        self.assertIsNone(stored_previous["pane_id"])
+        self.assertEqual(stored_previous["attachment_id"], "")
+        self.assertEqual(stored_previous["status"], "ended")
+        self.assertEqual(current["pane_id"], 7)
+        self.assertEqual(current["zellij_session"], "dev")
+
     def test_reconciliation_detaches_a_record_when_its_pane_is_missing(self):
         record = self.event("SessionStart")
         sessions = deck.subprocess.CompletedProcess([], 0, "dev [Created 1m ago] (current)\n", "")

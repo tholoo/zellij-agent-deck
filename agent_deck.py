@@ -592,6 +592,8 @@ def handle_event(payload: dict[str, Any]) -> dict[str, Any]:
     existing = RECORDS.get(key)
     zellij_session = clean(os.environ.get("ZELLIJ_SESSION_NAME"), 128)
     current_pane = pane_number(os.environ.get("ZELLIJ_PANE_ID"))
+    if event == "SessionStart" and clean(payload.get("source"), 32) == "clear":
+        detach_pane_records(zellij_session, current_pane, excluding_key=key)
     title_helper_prompt = event == "UserPromptSubmit" and is_title_generation_prompt(
         payload.get("prompt")
     )
@@ -754,6 +756,27 @@ def detach_session_records(session_id: str, excluding_key: str = "") -> list[dic
             record.get("key") == excluding_key
             or record.get("codex_session_id") != session_id
             or record.get("pane_id") is None
+        ):
+            continue
+        attachment_id = str(record.get("attachment_id") or "")
+        if attachment_id:
+            detached.append(detach_attachment(record["key"], attachment_id))
+        else:
+            detached.append(detach_record(record))
+    return detached
+
+
+def detach_pane_records(
+    zellij_session: str, pane_id: int | None, excluding_key: str = ""
+) -> list[dict[str, Any]]:
+    if not zellij_session or pane_id is None:
+        return []
+    detached = []
+    for record in RECORDS.list(include_dismissed=True):
+        if (
+            record.get("key") == excluding_key
+            or record.get("zellij_session") != zellij_session
+            or record.get("pane_id") != pane_id
         ):
             continue
         attachment_id = str(record.get("attachment_id") or "")
