@@ -551,7 +551,20 @@ def event_message(payload: dict[str, Any], event: str) -> str:
         if isinstance(candidate, dict):
             tool_input = candidate
         detail = tool_input.get("description") or tool_input.get("cmd") or tool_input.get("command")
-        return clean(f"{tool}: {detail}" if detail else f"Approval: {tool}", MESSAGE_LIMIT)
+        return clean(
+            f"Approval: {tool}: {detail}" if detail else f"Approval: {tool}", MESSAGE_LIMIT
+        )
+    if (
+        event == "PreToolUse"
+        and str(payload.get("tool_name", "")).split(".")[-1] == "request_user_input"
+    ):
+        inputs = payload.get("tool_input")
+        questions = inputs.get("questions") if isinstance(inputs, dict) else None
+        if isinstance(questions, list):
+            for question in questions:
+                if isinstance(question, dict) and question.get("question"):
+                    return clean(f"Question: {question['question']}", MESSAGE_LIMIT)
+        return "Waiting for your answer"
     if event in {"Stop", "SubagentStop"}:
         return clean(
             payload.get("last_assistant_message") or payload.get("stop_reason") or "Turn complete",
@@ -744,7 +757,19 @@ def handle_event(payload: dict[str, Any]) -> dict[str, Any]:
             record["status"] = "working"
             record["unread"] = False
             record["message"] = ""
-            record["activity"] = tool_activity(payload) if event == "PreToolUse" else "Working"
+            record["activity"] = tool_activity(payload)
+            if event == "PostToolUse":
+                record["activity"] = (
+                    record["activity"]
+                    .replace("Running ", "Finished ", 1)
+                    .replace("Using ", "Finished ", 1)
+                )
+            if (
+                event == "PreToolUse"
+                and str(payload.get("tool_name", "")).split(".")[-1] == "request_user_input"
+            ):
+                record["status"] = "needs_input"
+                record["unread"] = True
             if event == "PostToolUse" and payload.get("tool_error"):
                 record["status"] = "error"
                 record["unread"] = True
@@ -770,6 +795,7 @@ def handle_event(payload: dict[str, Any]) -> dict[str, Any]:
             "Stop",
             "SubagentStop",
             "PostToolUse",
+            "PreToolUse",
         }:
             record["attention_seq"] = record.get("attention_seq", 0) + 1
 

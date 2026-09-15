@@ -59,6 +59,20 @@ class AgentDeckTest(unittest.TestCase):
         done = self.event("Stop", last_assistant_message="Implemented it")
         self.assertEqual((done["status"], done["message"]), ("done", "Implemented it"))
 
+    def test_questions_and_finished_tools_are_described_from_existing_hooks(self):
+        waiting = self.event(
+            "PreToolUse",
+            tool_name="functions.request_user_input",
+            tool_input={"questions": [{"question": "Which environment should I use?"}]},
+        )
+        self.assertEqual((waiting["status"], waiting["unread"]), ("needs_input", True))
+        self.assertEqual(waiting["message"], "Question: Which environment should I use?")
+        completed = self.event(
+            "PostToolUse", tool_name="exec_command", tool_input={"cmd": "cargo test"}
+        )
+        self.assertEqual(completed["activity"], "Finished cargo test")
+        self.assertEqual(completed["status"], "working")
+
     def test_zero_numbered_terminal_is_preserved_by_reconciliation(self):
         with patch.dict(os.environ, {"ZELLIJ_PANE_ID": "0"}):
             record = self.event("SessionStart")
@@ -557,9 +571,13 @@ class AgentDeckTest(unittest.TestCase):
         self.assertFalse(Path(plan["path"]).exists())
         with self.assertRaisesRegex(SystemExit, "Branch already exists"):
             deck.worktree_plan(record, "main")
+        git("-C", str(other), "commit", "--allow-empty", "-m", "Change after preview")
         with patch.object(deck, "launch_worktree") as launch:
             result = deck.do_worktree(record, "feature/new", "", plan["base_head"])
             self.assertTrue(Path(result["path"]).is_dir())
+            self.assertEqual(
+                git("-C", result["path"], "rev-parse", "HEAD").stdout.strip(), plan["base_head"]
+            )
             launch.assert_called_once()
         with self.assertRaisesRegex(SystemExit, "destination already exists"):
             deck.worktree_plan(record, "feature/new")

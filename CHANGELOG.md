@@ -14,6 +14,8 @@ is based on Keep a Changelog, and the project follows Semantic Versioning.
 - Next-attention navigation, contextual help, and an optional one-line status layout.
 
 - Passive tool activity, explicit tool failures, and independent status/activity ages.
+- Passive blocking-question excerpts and completed-tool labels, with no extra
+  model requests or progress prompts.
 
 - Codex 0.150 generated thread names as Agent Deck titles, while preserving
   prompt-derived fallbacks and manual title overrides.
@@ -34,6 +36,8 @@ is based on Keep a Changelog, and the project follows Semantic Versioning.
 ### Fixed
 
 - Preserve selected sessions and action targets when incoming updates reorder rows.
+- Show reply content and its worktree target before confirmation, and filter a
+  worktree's agents by its exact checkout path.
 - Keep terminal pane zero attached during pane reconciliation.
 
 - Clear unread after normal pane navigation and for results observed in a focused

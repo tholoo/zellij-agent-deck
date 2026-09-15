@@ -64,6 +64,7 @@
             packages = [
               rustToolchain
               pkgs.gitleaks
+              pkgs.git
               pkgs.mypy
               pkgs.nixfmt
               pkgs.openssl
@@ -120,6 +121,7 @@
             inherit (manifest.package) version;
             src = source;
             nativeBuildInputs = [
+              pkgs.git
               pkgs.mypy
               pkgs.python3
               pkgs.ruff

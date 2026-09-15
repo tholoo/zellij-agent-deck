@@ -116,11 +116,11 @@ fn row_context(agent: &AgentRecord, width: usize) -> String {
     } else {
         &agent.message
     };
-    let branch = branch_label(agent);
+    let branch = truncate(&branch_label(agent), width / 2);
     if explanation.is_empty() {
         return format!("  {branch} · {}", agent.zellij_session);
     }
-    let available = width.saturating_sub(branch.width() + 7).max(width / 2);
+    let available = width.saturating_sub(branch.width() + 5);
     format!("  {} · {branch}", truncate(explanation, available))
 }
 
@@ -164,6 +164,9 @@ fn details(agent: &AgentRecord, now: u64) -> Vec<String> {
         branch_label(agent),
         format!("Worktree  {}", agent.project_root),
     ];
+    if !agent.message.is_empty() {
+        lines.insert(2, agent.message.clone());
+    }
     if agent.cwd != agent.project_root {
         lines.push(format!("Directory  {}", agent.cwd));
     }
@@ -199,9 +202,6 @@ fn details(agent: &AgentRecord, now: u64) -> Vec<String> {
             age(now, agent.activity_since)
         ));
     }
-    if !agent.message.is_empty() {
-        lines.push(agent.message.clone());
-    }
     lines
 }
 
@@ -211,13 +211,21 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     }
     let mut lines = Vec::new();
     let mut line = String::new();
-    for ch in text.chars() {
-        let size = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        if line.width() + size > width && !line.is_empty() {
+    for word in text.split_whitespace() {
+        if !line.is_empty() && line.width() + word.width() + 1 > width {
             lines.push(std::mem::take(&mut line));
         }
-        if size <= width {
-            line.push(ch);
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        for ch in word.chars() {
+            let size = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if line.width() + size > width && !line.is_empty() {
+                lines.push(std::mem::take(&mut line));
+            }
+            if size <= width {
+                line.push(ch);
+            }
         }
     }
     if !line.is_empty() {
@@ -479,6 +487,55 @@ pub(super) fn screen(deck: &mut AgentDeck, rows: usize, cols: usize, now: u64) -
         );
         return screen;
     }
+    if matches!(
+        deck.mode,
+        InputMode::Reply | InputMode::ConfirmReply | InputMode::Title | InputMode::ConfirmPark
+    ) {
+        let heading = match deck.mode {
+            InputMode::Reply | InputMode::ConfirmReply => "Reply to agent",
+            InputMode::Title => "Set session title",
+            _ => "Park session",
+        };
+        screen.put(margin, 2, width, heading, Style::Heading);
+        let mut lines = Vec::new();
+        if let Some(agent) = deck.selected_agent() {
+            lines.push(format!("{}: {}", agent.project, agent.title));
+            lines.push(format!(
+                "{} · {}",
+                branch_label(&agent),
+                agent.zellij_session
+            ));
+            lines.push(agent.cwd);
+        }
+        if deck.mode == InputMode::ConfirmReply {
+            lines.push(deck.staged.clone());
+        } else if deck.mode == InputMode::ConfirmPark {
+            lines.push("Send Ctrl-C to this agent's pane?".into());
+        } else {
+            lines.push(format!("{}_", deck.input));
+        }
+        for (index, line) in lines
+            .iter()
+            .flat_map(|line| wrap(line, width))
+            .take(rows - 7)
+            .enumerate()
+        {
+            screen.put(margin, index + 4, width, line, Style::Normal);
+        }
+        screen.put(margin, rows - 2, width, &deck.notice, Style::Heading);
+        screen.put(
+            margin,
+            rows - 1,
+            width,
+            if matches!(deck.mode, InputMode::ConfirmReply | InputMode::ConfirmPark) {
+                "y confirm · n / Esc cancel"
+            } else {
+                "Enter continue · Esc cancel"
+            },
+            Style::Muted,
+        );
+        return screen;
+    }
     if deck.mode == InputMode::Help {
         let help = [
             "NAVIGATE  ↑/↓ or j/k select · Enter open · n next attention",
@@ -528,7 +585,9 @@ pub(super) fn screen(deck: &mut AgentDeck, rows: usize, cols: usize, now: u64) -
     } else {
         &deck.model.query
     };
-    let context = if query.is_empty() {
+    let context = if let Some(path) = &deck.model.worktree_scope {
+        format!("Worktree: {path} · c clear · Search: {query}")
+    } else if query.is_empty() {
         format!(
             "{} view · v switch · subagents {}",
             if deck.model.group_by_project {
@@ -830,5 +889,44 @@ mod tests {
             .lines
             .iter()
             .all(|line| line.y < 18 && line.x + line.text.width() <= 55));
+    }
+
+    #[test]
+    fn reply_confirmation_shows_the_actual_message_and_target() {
+        let mut deck = AgentDeck {
+            mode: InputMode::ConfirmReply,
+            staged: "Please review the search changes".into(),
+            action_target: Some(AgentRecord {
+                project: "shop".into(),
+                title: "Search".into(),
+                branch: "feature/search".into(),
+                cwd: "/example/search".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let output = screen(&mut deck, 24, 80, 100);
+        let text = output
+            .lines
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Please review the search changes"));
+        assert!(text.contains("feature/search"));
+        assert!(text.contains("y confirm"));
+    }
+
+    #[test]
+    fn compact_status_fits_a_single_row() {
+        let mut deck = AgentDeck {
+            compact_status: true,
+            ..Default::default()
+        };
+        let output = screen(&mut deck, 1, 80, 100);
+        assert_eq!(output.lines.len(), 1);
+        assert_eq!(output.lines[0].y, 0);
+        assert!(output.lines[0].text.contains("0 need you"));
+        assert!(output.hits.is_empty());
     }
 }

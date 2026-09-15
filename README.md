@@ -12,9 +12,9 @@ first versioned release is tagged.
 > This project is an independent integration for Codex and Zellij. It is not
 > affiliated with or endorsed by OpenAI or the Zellij project.
 
-![Synthetic Zellij Agent Deck demo showing fictional agent sessions](docs/assets/agent-deck-demo.webp)
+![Zellij Agent Deck running with synthetic agent sessions](docs/assets/agent-deck-current.png)
 
-_Synthetic demo with fictional sessions and task data._
+_Actual plugin UI with fictional sessions and task data._
 
 ## Requirements
 
@@ -133,6 +133,8 @@ up shared read state within three seconds.
 Activity labels come directly from existing tool hooks. Agent Deck never asks
 Codex to generate progress descriptions. Status and activity ages are independent
 of metadata refreshes and read acknowledgements.
+Blocking questions from `request_user_input` appear as **Needs you**. Completed
+tools are labeled **Finished …** while the agent continues its turn.
 
 The plugin listens for Zellij pane-close events and periodically reconciles its
 records with Zellij 0.45's structured pane list. This also catches force-closed

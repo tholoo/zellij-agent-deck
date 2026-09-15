@@ -147,6 +147,7 @@ struct DeckModel {
     viewport_start: usize,
     show_inactive: bool,
     group_by_project: bool,
+    worktree_scope: Option<String>,
 }
 
 impl DeckModel {
@@ -177,6 +178,10 @@ impl DeckModel {
             .enumerate()
             .filter(|(_, agent)| {
                 self.matches_filter(agent)
+                    && self
+                        .worktree_scope
+                        .as_ref()
+                        .is_none_or(|path| agent.project_root == *path)
                     && (self.filter != 0
                         || self.show_inactive
                         || !query.is_empty()
@@ -285,6 +290,7 @@ impl DeckModel {
     }
 
     fn clear_query(&mut self) {
+        self.worktree_scope = None;
         self.set_query(String::new());
     }
 
@@ -401,7 +407,7 @@ impl AgentDeck {
     fn selected_agent(&self) -> Option<AgentRecord> {
         if !matches!(
             self.mode,
-            InputMode::Browse | InputMode::Search | InputMode::Help
+            InputMode::Browse | InputMode::Search | InputMode::Help | InputMode::Details
         ) {
             if let Some(target) = &self.action_target {
                 return Some(target.clone());
@@ -670,6 +676,7 @@ impl AgentDeck {
             self.last_attention_key = agent.key.clone();
             self.model.filter = 0;
             self.model.query.clear();
+            self.model.worktree_scope = None;
             self.model.restore_selection(Some(&agent.key), None);
             self.jump_selected();
         } else {
@@ -739,7 +746,8 @@ impl AgentDeck {
             self.cancel_input();
             self.model.filter = 0;
             self.model.show_inactive = true;
-            self.model.set_query(item.path);
+            self.model.set_query(String::new());
+            self.model.worktree_scope = Some(item.path);
             self.model.restore_selection(Some(&agents[0].key), None);
             if agents.len() == 1 {
                 self.jump_selected();
@@ -787,6 +795,9 @@ impl AgentDeck {
 
     fn activate_after_permissions_granted(&mut self) {
         self.permissions_granted = true;
+        if let Some(plugin_id) = self.plugin_id {
+            rename_plugin_pane(plugin_id, "Agent Deck");
+        }
         self.current_session = get_session_environment_variables()
             .remove("ZELLIJ_SESSION_NAME")
             .unwrap_or_default();
@@ -1137,7 +1148,15 @@ impl AgentDeck {
                 }
                 Err(error) => self.notice = format!("Could not read agent state: {error}"),
             }
-        } else if operation != "list" {
+        } else if operation == "list" {
+            self.notice = truncate(
+                &format!(
+                    "Could not refresh sessions: {}",
+                    String::from_utf8_lossy(&stderr).trim()
+                ),
+                180,
+            );
+        } else {
             if code.unwrap_or(1) == 0 {
                 self.notice = format!("{operation} complete");
                 self.refresh(false, false);
@@ -1302,7 +1321,7 @@ impl ZellijPlugin for AgentDeck {
                 ui::Style::Heading => text.color_all(1),
                 ui::Style::Muted => text.unbold_all(),
                 ui::Style::Selected => text.selected(),
-                ui::Style::Alert => text.error_color_all(),
+                ui::Style::Alert => text.color_all(0),
                 ui::Style::Normal => text,
             };
             print_text_with_coordinates(text, line.x, line.y, Some(line.width), None);
@@ -1585,6 +1604,59 @@ mod tests {
         deck.handle_result(Some(0), b"{}".to_vec(), vec![], context);
         assert_eq!(deck.mode, InputMode::Browse);
         assert!(deck.worktree_plan.is_none());
+    }
+
+    #[test]
+    fn next_attention_cycles_seen_requests_and_new_results_across_filters() {
+        let mut pending = unread_agent("a", "work", 1);
+        pending.status = "needs_input".into();
+        pending.unread = false;
+        let mut deck = AgentDeck {
+            model: DeckModel {
+                agents: vec![pending, unread_agent("b", "peer", 2)],
+                filter: 6,
+                query: "no matches".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for key in ["a", "b", "a"] {
+            deck.jump_next_attention();
+            assert_eq!(deck.selected_agent().unwrap().key, key);
+        }
+    }
+
+    #[test]
+    fn focus_tracking_subscribes_to_client_and_navigation_updates() {
+        for event in [
+            EventType::ListClients,
+            EventType::PaneUpdate,
+            EventType::TabUpdate,
+            EventType::SessionUpdate,
+        ] {
+            assert!(AgentDeck::subscribed_events().contains(&event));
+        }
+    }
+
+    #[test]
+    fn worktree_scope_matches_exact_checkout_and_can_be_cleared() {
+        let mut model = DeckModel {
+            worktree_scope: Some("/repo/search".into()),
+            agents: vec![
+                AgentRecord {
+                    project_root: "/repo/search".into(),
+                    ..unread_agent("a", "work", 1)
+                },
+                AgentRecord {
+                    project_root: "/repo/search-next".into(),
+                    ..unread_agent("b", "work", 2)
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(model.matching_indices(None), vec![0]);
+        model.clear_query();
+        assert_eq!(model.matching_indices(None), vec![0, 1]);
     }
 
     #[test]
