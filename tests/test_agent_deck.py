@@ -56,6 +56,49 @@ class AgentDeckTest(unittest.TestCase):
         done = self.event("Stop", last_assistant_message="Implemented it")
         self.assertEqual((done["status"], done["message"]), ("done", "Implemented it"))
 
+    def test_acknowledgement_cannot_clear_a_newer_result_or_attachment(self):
+        first = self.event("Stop", last_assistant_message="First result")
+        second = self.event("Stop", last_assistant_message="Second result")
+        stale = deck.mark_read(first["key"], first["attention_seq"], first["attachment_id"])
+        self.assertTrue(stale["unread"])
+        seen = deck.mark_read(second["key"], second["attention_seq"], second["attachment_id"])
+        self.assertFalse(seen["unread"])
+        self.assertEqual(seen["status"], "done")
+        self.event("SessionStart")
+        latest = self.event("Stop")
+        stale = deck.mark_read(latest["key"], latest["attention_seq"], first["attachment_id"])
+        self.assertTrue(stale["unread"])
+
+    def test_activity_is_passive_and_times_survive_metadata_and_read_updates(self):
+        with patch.object(deck, "now", return_value=100):
+            self.event("UserPromptSubmit", prompt="fix tests")
+        with patch.object(deck, "now", return_value=110):
+            running = self.event(
+                "PreToolUse", tool_name="exec_command", tool_input={"cmd": "cargo test"}
+            )
+        self.assertEqual(running["activity"], "Running cargo test")
+        self.assertEqual(running["status_since"], 100)
+        self.assertEqual(running["activity_since"], 110)
+        with patch.object(deck, "now", return_value=120):
+            done = self.event("Stop", last_assistant_message="Tests pass")
+        with patch.object(deck, "now", return_value=130):
+            seen = deck.mark_read(done["key"])
+            with patch.object(deck.shutil, "which", return_value=None):
+                refreshed = deck.enrich(seen)
+        self.assertEqual(refreshed["status_since"], 120)
+        self.assertEqual(refreshed["activity_since"], 120)
+        self.assertEqual(refreshed["activity"], "")
+
+    def test_tool_failures_get_an_explicit_status_and_clear_on_retry(self):
+        failed = self.event("PostToolUse", tool_name="exec_command", tool_error="Tests failed")
+        self.assertEqual((failed["status"], failed["unread"]), ("error", True))
+        retried = self.event(
+            "PreToolUse", tool_name="exec_command", tool_input={"cmd": "cargo test"}
+        )
+        self.assertEqual(
+            (retried["status"], retried["unread"], retried["message"]), ("working", False, "")
+        )
+
     def test_session_end_detaches_parent_and_subagents_but_keeps_resume_data(self):
         parent = self.event("SessionStart")
         child = self.event("SubagentStart", agent_id="child", agent_type="worker")

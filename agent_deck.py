@@ -79,12 +79,20 @@ class RecordStore:
         "title",
         "status",
         "message",
+        "activity",
         "model",
         "branch",
         "pr",
     }
     _BOOL_FIELDS = {"title_locked", "unread", "dismissed", "dirty"}
-    _INTEGER_FIELDS = {"started_at", "updated_at"}
+    _INTEGER_FIELDS = {
+        "started_at",
+        "updated_at",
+        "status_since",
+        "activity_since",
+        "attention_seq",
+        "revision",
+    }
 
     def __init__(self, root: Path | None = None):
         self._configured_root = root
@@ -144,6 +152,16 @@ class RecordStore:
     @staticmethod
     def _migrate(record: dict[str, Any]) -> bool:
         migrated = False
+        for field, value in {
+            "activity": "",
+            "status_since": record.get("updated_at", 0),
+            "activity_since": record.get("updated_at", 0),
+            "attention_seq": int(bool(record.get("unread"))),
+            "revision": 0,
+        }.items():
+            if field not in record:
+                record[field] = value
+                migrated = True
         if record.get("kind") == "internal" and not record.get("dismissed"):
             record["dismissed"] = True
             record["unread"] = False
@@ -216,6 +234,14 @@ class RecordStore:
             updated = transition(record.copy())
             if updated.get("key") != key:
                 raise ValueError("record transition changed its key")
+            if updated.get("status") != record.get("status") or "status_since" not in updated:
+                updated["status_since"] = now()
+            if (
+                updated.get("activity", "") != record.get("activity", "")
+                or "activity_since" not in updated
+            ):
+                updated["activity_since"] = now()
+            updated["revision"] = record.get("revision", 0) + 1
             self._write(updated)
             return updated
 
@@ -237,6 +263,7 @@ class RecordStore:
                     result.append(record)
         rank = {
             "needs_input": 0,
+            "error": 0,
             "done": 1,
             "working": 2,
             "idle": 3,
@@ -245,9 +272,16 @@ class RecordStore:
         }
         result.sort(
             key=lambda item: (
-                not item.get("unread", False),
+                0
+                if item.get("status") in {"needs_input", "error"}
+                else 1
+                if item.get("status") == "done" and item.get("unread")
+                else 2
+                if item.get("status") == "working"
+                else 3,
                 rank.get(str(item.get("status") or ""), 9),
-                -item.get("updated_at", 0),
+                -item.get("status_since", item.get("updated_at", 0)),
+                item["key"],
             )
         )
         return result
@@ -478,6 +512,11 @@ def base_record(
         "unread": False,
         "dismissed": False,
         "message": "",
+        "activity": "",
+        "attention_seq": 0,
+        "revision": 0,
+        "status_since": stamp,
+        "activity_since": stamp,
         "model": clean(payload.get("model"), 64),
         "pr": "",
         "ports": [],
@@ -510,6 +549,20 @@ def event_message(payload: dict[str, Any], event: str) -> str:
     if event == "PostToolUse" and payload.get("tool_error"):
         return clean(payload.get("tool_error"), MESSAGE_LIMIT)
     return ""
+
+
+def tool_activity(payload: dict[str, Any]) -> str:
+    """Describe observed tool inputs; never ask the agent to report its activity."""
+    tool = clean(payload.get("tool_name"), 64)
+    candidate = payload.get("tool_input")
+    inputs = candidate if isinstance(candidate, dict) else {}
+    command = inputs.get("cmd") or inputs.get("command")
+    if command:
+        return clean(f"Running {command}", MESSAGE_LIMIT)
+    path = inputs.get("file_path") or inputs.get("path")
+    if path:
+        return clean(f"{tool}: {path}", MESSAGE_LIMIT)
+    return clean(f"Using {tool}" if tool else "Working", MESSAGE_LIMIT)
 
 
 def title_generation_parent_key(session_id: str, zellij_session: str, pane_id: int | None) -> str:
@@ -670,6 +723,8 @@ def handle_event(payload: dict[str, Any]) -> dict[str, Any]:
                 record["attachment_id"] = ""
         elif event == "UserPromptSubmit":
             record["status"] = "working"
+            record["status_since"] = now()
+            record["activity"] = "Working"
             record["unread"] = False
             record["message"] = ""
             if not record.get("title_locked"):
@@ -677,6 +732,11 @@ def handle_event(payload: dict[str, Any]) -> dict[str, Any]:
         elif event in {"PreToolUse", "PostToolUse", "SubagentStart"}:
             record["status"] = "working"
             record["unread"] = False
+            record["message"] = ""
+            record["activity"] = tool_activity(payload) if event == "PreToolUse" else "Working"
+            if event == "PostToolUse" and payload.get("tool_error"):
+                record["status"] = "error"
+                record["unread"] = True
         elif event == "PermissionRequest":
             record["status"] = "needs_input"
             record["unread"] = True
@@ -691,6 +751,16 @@ def handle_event(payload: dict[str, Any]) -> dict[str, Any]:
         elif event == "SessionStart":
             record["status"] = "idle"
             record["unread"] = False
+
+        if record["status"] != "working":
+            record["activity"] = ""
+        if record["unread"] and event in {
+            "PermissionRequest",
+            "Stop",
+            "SubagentStop",
+            "PostToolUse",
+        }:
+            record["attention_seq"] = record.get("attention_seq", 0) + 1
 
         if native_title and not record_is_title_helper and not record.get("title_locked"):
             record["title"] = native_title
@@ -877,6 +947,25 @@ def mutate(key: str, **changes: Any) -> dict[str, Any]:
     return record
 
 
+def mark_read(
+    key: str, attention_seq: int | None = None, attachment_id: str | None = None
+) -> dict[str, Any]:
+    def transition(record: dict[str, Any]) -> dict[str, Any]:
+        if attention_seq is not None and record.get("attention_seq", 0) != attention_seq:
+            return record
+        if attachment_id is not None and record.get("attachment_id", "") != attachment_id:
+            return record
+        record["unread"] = False
+        return record
+
+    try:
+        record = RECORDS.update(key, transition)
+    except KeyError:
+        raise SystemExit(f"agent not found: {key}") from None
+    pipe_event(record)
+    return record
+
+
 def target_prefix(record: dict[str, Any]) -> tuple[list[str], str]:
     session = record.get("zellij_session")
     pane = record.get("pane_id")
@@ -1046,6 +1135,9 @@ def parser() -> argparse.ArgumentParser:
     for name in ("mark-read", "dismiss", "park"):
         action = sub.add_parser(name)
         action.add_argument("key")
+        if name == "mark-read":
+            action.add_argument("--attention-seq", type=int)
+            action.add_argument("--attachment-id")
     resume = sub.add_parser("resume")
     resume.add_argument("key")
     resume.add_argument("fallback_session", nargs="?", default="")
@@ -1081,7 +1173,7 @@ def main() -> None:
             items = [enrich(item) for item in items]
         print(json.dumps(items, ensure_ascii=False, separators=(",", ":")))
     elif args.command == "mark-read":
-        print(json.dumps(mutate(args.key, unread=False)))
+        print(json.dumps(mark_read(args.key, args.attention_seq, args.attachment_id)))
     elif args.command == "dismiss":
         print(json.dumps(mutate(args.key, dismissed=True, unread=False)))
     elif args.command == "title":

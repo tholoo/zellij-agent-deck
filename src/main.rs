@@ -21,12 +21,17 @@ struct AgentRecord {
     unread: bool,
     dismissed: bool,
     message: String,
+    activity: String,
     model: String,
     branch: String,
     dirty: bool,
     pr: String,
     ports: Vec<u16>,
     updated_at: u64,
+    status_since: u64,
+    activity_since: u64,
+    attention_seq: u64,
+    revision: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -44,7 +49,6 @@ enum InputMode {
 
 #[derive(Clone, Debug, PartialEq)]
 enum JumpAction {
-    MarkRead { key: String },
     HideDeck,
     FocusTerminalPane { pane_id: u32 },
     SwitchSession { session: String, pane_id: u32 },
@@ -98,13 +102,7 @@ fn jump_plan(current_session: &str, agent: &AgentRecord) -> Result<Vec<JumpActio
             pane_id,
         }
     };
-    Ok(vec![
-        JumpAction::MarkRead {
-            key: agent.key.clone(),
-        },
-        JumpAction::HideDeck,
-        navigate,
-    ])
+    Ok(vec![JumpAction::HideDeck, navigate])
 }
 
 #[derive(Default)]
@@ -255,6 +253,8 @@ struct AgentDeck {
     refresh_ticks: u8,
     next_list_request: u64,
     applied_list_request: u64,
+    focus_request: Option<Vec<AgentRecord>>,
+    acknowledged: BTreeMap<String, (String, u64)>,
 }
 
 const FILTERS: [&str; 7] = [
@@ -271,7 +271,7 @@ impl AgentDeck {
         ]
     }
 
-    fn subscribed_events() -> [EventType; 7] {
+    fn subscribed_events() -> [EventType; 11] {
         [
             EventType::Key,
             EventType::Mouse,
@@ -280,6 +280,10 @@ impl AgentDeck {
             EventType::RunCommandResult,
             EventType::PermissionRequestResult,
             EventType::PaneClosed,
+            EventType::PaneUpdate,
+            EventType::TabUpdate,
+            EventType::SessionUpdate,
+            EventType::ListClients,
         ]
     }
 
@@ -370,9 +374,6 @@ impl AgentDeck {
                 Ok(actions) => {
                     for action in actions {
                         match action {
-                            JumpAction::MarkRead { key } => {
-                                self.run_helper("mark-read", &["mark-read".into(), key]);
-                            }
                             JumpAction::HideDeck => hide_self(),
                             JumpAction::FocusTerminalPane { pane_id } => {
                                 focus_terminal_pane(pane_id, false, false);
@@ -389,6 +390,15 @@ impl AgentDeck {
     }
 
     fn apply_agent_signal(&mut self, agent: AgentRecord) {
+        if self
+            .model
+            .agents
+            .iter()
+            .any(|existing| existing.key == agent.key && existing.revision > agent.revision)
+        {
+            return;
+        }
+        let agent = self.merge_acknowledgement(agent);
         if agent.dismissed {
             self.model
                 .agents
@@ -411,6 +421,7 @@ impl AgentDeck {
             self.model.agents.push(agent.clone());
         }
         self.clamp_selection();
+        self.request_focus();
         if self.permissions_granted {
             self.sync_agent_pane(&agent);
             self.refresh(false, false);
@@ -425,7 +436,7 @@ impl AgentDeck {
         if let Some(pane_id) = agent.pane_id {
             let pane = PaneId::Terminal(pane_id);
             let wants_attention =
-                agent.unread && matches!(agent.status.as_str(), "needs_input" | "done");
+                agent.unread && matches!(agent.status.as_str(), "needs_input" | "error" | "done");
             if wants_attention {
                 highlight_and_unhighlight_panes(vec![pane], vec![]);
             } else {
@@ -462,6 +473,86 @@ impl AgentDeck {
             }
         }
         self.clamp_selection();
+    }
+
+    fn merge_acknowledgement(&self, mut agent: AgentRecord) -> AgentRecord {
+        if self.acknowledged.get(&agent.key)
+            == Some(&(agent.attachment_id.clone(), agent.attention_seq))
+        {
+            agent.unread = false;
+        }
+        agent
+    }
+
+    fn request_focus(&mut self) {
+        if self.focus_request.is_some() {
+            return;
+        }
+        let candidates = self
+            .model
+            .agents
+            .iter()
+            .filter(|agent| {
+                agent.unread
+                    && !agent.dismissed
+                    && agent.kind != "subagent"
+                    && agent.zellij_session == self.current_session
+                    && is_attached(agent)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return;
+        }
+        // Capture the result generations BEFORE querying focus. A completion
+        // arriving while this request is in flight needs its own observation.
+        self.focus_request = Some(candidates);
+        if self.permissions_granted {
+            list_clients();
+        }
+    }
+
+    fn acknowledge_clients(&mut self, clients: Vec<ClientInfo>) {
+        let candidates = self.focus_request.take().unwrap_or_default();
+        for candidate in candidates {
+            if !clients
+                .iter()
+                .any(|client| Some(client.pane_id) == candidate.pane_id.map(PaneId::Terminal))
+            {
+                continue;
+            }
+            if let Some(agent) = self.model.agents.iter_mut().find(|agent| {
+                agent.key == candidate.key
+                    && agent.unread
+                    && agent.attachment_id == candidate.attachment_id
+                    && agent.attention_seq == candidate.attention_seq
+            }) {
+                agent.unread = false;
+                self.acknowledged.insert(
+                    agent.key.clone(),
+                    (agent.attachment_id.clone(), agent.attention_seq),
+                );
+                let agent = agent.clone();
+                let mut context = Self::context("auto-read");
+                context.insert("key".into(), agent.key.clone());
+                self.run_helper_with_context(
+                    &[
+                        "mark-read".into(),
+                        agent.key.clone(),
+                        "--attention-seq".into(),
+                        agent.attention_seq.to_string(),
+                        "--attachment-id".into(),
+                        agent.attachment_id.clone(),
+                    ],
+                    context,
+                );
+                if self.permissions_granted {
+                    self.sync_agent_pane(&agent);
+                }
+            }
+        }
+        // Any result received during the query gets a fresh focus observation.
+        // Don't repeatedly query unread background panes here.
     }
 
     fn activate_after_permissions_granted(&mut self) {
@@ -609,6 +700,16 @@ impl AgentDeck {
         context: BTreeMap<String, String>,
     ) {
         let operation = context.get("operation").map(String::as_str).unwrap_or("");
+        if operation == "auto-read" {
+            if code.unwrap_or(1) != 0 {
+                if let Some(key) = context.get("key") {
+                    self.acknowledged.remove(key);
+                }
+                self.notice = "Could not save read state; will retry".into();
+            }
+            self.refresh(false, false);
+            return;
+        }
         if operation == "list" && code.unwrap_or(1) == 0 {
             let request_id = context
                 .get("request_id")
@@ -620,8 +721,23 @@ impl AgentDeck {
             match serde_json::from_slice::<Vec<AgentRecord>>(&stdout) {
                 Ok(agents) => {
                     self.applied_list_request = request_id;
-                    self.model.agents = agents;
+                    self.model.agents = agents
+                        .into_iter()
+                        .map(|agent| {
+                            let newest = self
+                                .model
+                                .agents
+                                .iter()
+                                .find(|existing| {
+                                    existing.key == agent.key && existing.revision > agent.revision
+                                })
+                                .cloned()
+                                .unwrap_or(agent);
+                            self.merge_acknowledgement(newest)
+                        })
+                        .collect();
                     self.clamp_selection();
+                    self.request_focus();
                     if self.notice.starts_with("Refreshing") {
                         self.notice = "Metadata refreshed".into();
                     }
@@ -682,7 +798,15 @@ impl ZellijPlugin for AgentDeck {
             Event::Timer(_) => {
                 self.refresh_ticks = self.refresh_ticks.wrapping_add(1);
                 self.refresh(false, self.refresh_ticks.is_multiple_of(10));
-                set_timeout(if self.visible { 3.0 } else { 15.0 });
+                set_timeout(3.0);
+                self.request_focus();
+            }
+            Event::PaneUpdate(_) | Event::TabUpdate(_) | Event::SessionUpdate(_, _) => {
+                self.request_focus();
+            }
+            Event::ListClients(clients) => {
+                self.acknowledge_clients(clients);
+                return true;
             }
             Event::PaneClosed(PaneId::Terminal(pane_id)) => {
                 self.handle_closed_pane(pane_id);
@@ -948,6 +1072,138 @@ register_plugin!(AgentDeck);
 mod tests {
     use super::*;
 
+    #[test]
+    fn manually_visiting_an_agent_clears_unread_without_resolving_approval() {
+        let mut deck = AgentDeck {
+            current_session: "work".into(),
+            model: DeckModel {
+                agents: vec![AgentRecord {
+                    key: "codex:visit".into(),
+                    zellij_session: "work".into(),
+                    pane_id: Some(7),
+                    attachment_id: "first".into(),
+                    status: "needs_input".into(),
+                    unread: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        deck.update(Event::PaneUpdate(PaneManifest::default()));
+        deck.update(Event::ListClients(vec![ClientInfo::new(
+            1,
+            PaneId::Terminal(7),
+            "codex".into(),
+            true,
+        )]));
+        assert!(
+            !deck.model.agents[0].unread,
+            "manual visit must clear unread"
+        );
+        assert_eq!(deck.model.agents[0].status, "needs_input");
+    }
+
+    fn unread_agent(key: &str, session: &str, pane_id: u32) -> AgentRecord {
+        AgentRecord {
+            key: key.into(),
+            zellij_session: session.into(),
+            pane_id: Some(pane_id),
+            attachment_id: "first".into(),
+            attention_seq: 1,
+            revision: 1,
+            status: "done".into(),
+            unread: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn background_tabs_other_sessions_and_detached_clients_do_not_count_as_seen() {
+        let mut deck = AgentDeck {
+            current_session: "work".into(),
+            model: DeckModel {
+                agents: vec![
+                    unread_agent("background-tab", "work", 7),
+                    unread_agent("other-session", "other", 8),
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        deck.update(Event::TabUpdate(vec![]));
+        deck.update(Event::ListClients(vec![ClientInfo::new(
+            1,
+            PaneId::Terminal(8),
+            String::new(),
+            true,
+        )]));
+        assert!(deck.model.agents.iter().all(|agent| agent.unread));
+        deck.update(Event::TabUpdate(vec![]));
+        deck.update(Event::ListClients(vec![]));
+        assert!(deck.model.agents.iter().all(|agent| agent.unread));
+    }
+
+    #[test]
+    fn stale_focus_observation_does_not_acknowledge_a_new_result() {
+        let mut deck = AgentDeck {
+            current_session: "work".into(),
+            model: DeckModel {
+                agents: vec![unread_agent("agent", "work", 7)],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        deck.update(Event::PaneUpdate(PaneManifest::default()));
+        let mut next = deck.model.agents[0].clone();
+        next.attention_seq = 2;
+        next.revision = 2;
+        deck.apply_agent_signal(next);
+        deck.update(Event::ListClients(vec![ClientInfo::new(
+            1,
+            PaneId::Terminal(7),
+            String::new(),
+            true,
+        )]));
+        assert!(deck.model.agents[0].unread);
+        deck.update(Event::PaneUpdate(PaneManifest::default()));
+        deck.update(Event::ListClients(vec![ClientInfo::new(
+            1,
+            PaneId::Terminal(7),
+            String::new(),
+            true,
+        )]));
+        assert!(!deck.model.agents[0].unread);
+    }
+
+    #[test]
+    fn stale_signals_and_list_snapshots_cannot_restore_acknowledged_unread() {
+        let original = unread_agent("agent", "work", 7);
+        let mut deck = AgentDeck {
+            current_session: "work".into(),
+            model: DeckModel {
+                agents: vec![original.clone()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        deck.request_focus();
+        deck.acknowledge_clients(vec![ClientInfo::new(
+            1,
+            PaneId::Terminal(7),
+            String::new(),
+            true,
+        )]);
+        deck.apply_agent_signal(original.clone());
+        deck.handle_result(
+            Some(0),
+            serde_json::to_vec(&vec![original]).unwrap(),
+            vec![],
+            AgentDeck::context("list"),
+        );
+        assert!(!deck.model.agents[0].unread);
+    }
+
     // The Zellij SDK imports this host function even when a unit test does not
     // exercise a host command. Native tests provide a no-op implementation so
     // the test binary can link outside the WASM host.
@@ -1059,9 +1315,6 @@ mod tests {
         assert_eq!(
             jump_plan("work", &agent),
             Ok(vec![
-                JumpAction::MarkRead {
-                    key: "codex:example".into(),
-                },
                 JumpAction::HideDeck,
                 JumpAction::FocusTerminalPane { pane_id: 7 },
             ])
@@ -1099,9 +1352,6 @@ mod tests {
         assert_eq!(
             jump_plan("deck", &agent),
             Ok(vec![
-                JumpAction::MarkRead {
-                    key: "codex:example".into(),
-                },
                 JumpAction::HideDeck,
                 JumpAction::SwitchSession {
                     session: "work".into(),

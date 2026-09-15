@@ -100,6 +100,22 @@ Closed sessions leave the live deck immediately but remain available under the
 `7:resume` filter until dismissed or expired. Set
 `ZELLIJ_AGENT_DECK_STATE_DIR` to use another runtime location.
 
+Visiting a Codex pane through normal Zellij navigation clears its unread dot,
+including across tabs and sessions. Results arriving in a focused pane are
+acknowledged automatically. Focus means the active terminal pane of an attached
+Zellij client; desktop window focus is not tracked. Background tabs, detached
+clients, and the terminal underneath a focused floating plugin do not count.
+Subagents sharing their parent's pane keep independent unread state.
+
+Reading an approval or failure leaves its status intact until the agent continues.
+Acknowledgements apply to the observed result and pane attachment, so a newer
+result cannot be cleared by an older acknowledgement. Other deck instances pick
+up shared read state within three seconds.
+
+Activity labels come directly from existing tool hooks. Agent Deck never asks
+Codex to generate progress descriptions. Status and activity ages are independent
+of metadata refreshes and read acknowledgements.
+
 The plugin listens for Zellij pane-close events and periodically reconciles its
 records with Zellij 0.45's structured pane list. This also catches force-closed
 panes and dead Zellij sessions when no Codex shutdown hook can run.

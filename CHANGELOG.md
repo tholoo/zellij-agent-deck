@@ -7,6 +7,8 @@ is based on Keep a Changelog, and the project follows Semantic Versioning.
 
 ### Added
 
+- Passive tool activity, explicit tool failures, and independent status/activity ages.
+
 - Codex 0.150 generated thread names as Agent Deck titles, while preserving
   prompt-derived fallbacks and manual title overrides.
 - Default-off subagent visibility with a runtime toggle, plugin configuration,
@@ -24,6 +26,10 @@ is based on Keep a Changelog, and the project follows Semantic Versioning.
 - Nix package for the host bridge and WASI plugin.
 
 ### Fixed
+
+- Clear unread after normal pane navigation and for results observed in a focused
+  attached client, with generation checks protecting newer results and reused panes.
+- Prevent stale record updates from restoring acknowledged unread indicators.
 
 - Hide Codex's internal automatic title-generation session from the agent list,
   including overlapping hook events and previously leaked helper records.
