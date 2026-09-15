@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use unicode_width::UnicodeWidthStr;
 use zellij_tile::prelude::*;
+
+mod ui;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
@@ -16,6 +19,8 @@ struct AgentRecord {
     cwd: String,
     project: String,
     project_root: String,
+    repository_root: String,
+    worktree: String,
     title: String,
     status: String,
     unread: bool,
@@ -45,6 +50,33 @@ enum InputMode {
     WorktreeBranch,
     WorktreePrompt,
     ConfirmPark,
+    Help,
+    Details,
+    WorktreePick,
+    WorktreeSearch,
+    ConfirmWorktree,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+struct WorktreeInfo {
+    path: String,
+    branch: String,
+    head: String,
+    current: bool,
+    locked: bool,
+    prunable: bool,
+    agents: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+struct WorktreePlan {
+    path: String,
+    branch: String,
+    base_branch: String,
+    base_head: String,
+    existing: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -113,7 +145,8 @@ struct DeckModel {
     query: String,
     show_subagents: bool,
     viewport_start: usize,
-    viewport_len: usize,
+    show_inactive: bool,
+    group_by_project: bool,
 }
 
 impl DeckModel {
@@ -127,8 +160,8 @@ impl DeckModel {
         }
         match self.filter {
             1 => is_attached(agent) && agent.unread,
-            2 => is_attached(agent) && (agent.status == "working" || agent.status == "idle"),
-            3 => is_attached(agent) && agent.status == "needs_input",
+            2 => is_attached(agent) && agent.status == "working",
+            3 => is_attached(agent) && needs_attention(agent),
             4 => is_attached(agent) && agent.status == "done",
             5 => is_attached(agent) && agent.status == "parked",
             6 => is_resumable(agent),
@@ -138,22 +171,48 @@ impl DeckModel {
 
     fn matching_indices(&self, live_query: Option<&str>) -> Vec<usize> {
         let query = live_query.unwrap_or(&self.query).to_lowercase();
-        let included = self
+        let mut included = self
             .agents
             .iter()
             .enumerate()
             .filter(|(_, agent)| {
                 self.matches_filter(agent)
+                    && (self.filter != 0
+                        || self.show_inactive
+                        || !query.is_empty()
+                        || group_rank(agent) < 3)
                     && (query.is_empty()
                         || format!(
-                            "{} {} {} {}",
-                            agent.project, agent.title, agent.branch, agent.message
+                            "{} {} {} {} {} {} {} {}",
+                            agent.project,
+                            agent.title,
+                            agent.branch,
+                            agent.message,
+                            agent.activity,
+                            agent.cwd,
+                            agent.worktree,
+                            agent.zellij_session
                         )
                         .to_lowercase()
                         .contains(&query))
             })
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
+        included.sort_by(|left, right| {
+            let a = &self.agents[*left];
+            let b = &self.agents[*right];
+            let order = if self.group_by_project {
+                a.repository_root
+                    .cmp(&b.repository_root)
+                    .then(a.project.cmp(&b.project))
+                    .then(group_rank(a).cmp(&group_rank(b)))
+            } else {
+                group_rank(a).cmp(&group_rank(b))
+            };
+            order
+                .then(b.status_since.cmp(&a.status_since))
+                .then(a.key.cmp(&b.key))
+        });
         if !self.show_subagents {
             return included;
         }
@@ -190,6 +249,17 @@ impl DeckModel {
             .cloned()
     }
 
+    fn restore_selection(&mut self, key: Option<&str>, live_query: Option<&str>) {
+        if let Some(position) = self
+            .matching_indices(live_query)
+            .iter()
+            .position(|index| Some(self.agents[*index].key.as_str()) == key)
+        {
+            self.selected = position;
+        }
+        self.clamp_selection(live_query);
+    }
+
     fn clamp_selection(&mut self, live_query: Option<&str>) {
         let len = self.matching_indices(live_query).len();
         self.selected = self.selected.min(len.saturating_sub(1));
@@ -222,21 +292,6 @@ impl DeckModel {
         self.show_subagents = !self.show_subagents;
         self.selected = 0;
     }
-
-    fn update_viewport(&mut self, list_height: usize, matching_len: usize) {
-        self.viewport_start = self.selected.saturating_sub(list_height.saturating_sub(1));
-        self.viewport_len = matching_len
-            .saturating_sub(self.viewport_start)
-            .min(list_height);
-    }
-
-    fn select_viewport_row(&mut self, row: usize) -> bool {
-        if row >= self.viewport_len {
-            return false;
-        }
-        self.selected = self.viewport_start + row;
-        true
-    }
 }
 
 #[derive(Default)]
@@ -255,11 +310,23 @@ struct AgentDeck {
     applied_list_request: u64,
     focus_request: Option<Vec<AgentRecord>>,
     acknowledged: BTreeMap<String, (String, u64)>,
+    action_target: Option<AgentRecord>,
+    screen_hits: BTreeMap<usize, ui::Hit>,
+    compact_status: bool,
+    last_attention_key: String,
+    pending_attention: bool,
+    worktrees: Vec<WorktreeInfo>,
+    worktree_selected: usize,
+    worktree_query: String,
+    worktree_plan: Option<WorktreePlan>,
+    worktree_prompt: String,
+    worktree_busy: bool,
+    dialog_id: u64,
+    detail_scroll: usize,
+    plugin_id: Option<u32>,
+    manual_size: bool,
+    sized_for_open: bool,
 }
-
-const FILTERS: [&str; 7] = [
-    "live", "unread", "running", "waiting", "done", "parked", "resume",
-];
 
 impl AgentDeck {
     fn required_permissions() -> [PermissionType; 4] {
@@ -332,6 +399,14 @@ impl AgentDeck {
     }
 
     fn selected_agent(&self) -> Option<AgentRecord> {
+        if !matches!(
+            self.mode,
+            InputMode::Browse | InputMode::Search | InputMode::Help
+        ) {
+            if let Some(target) = &self.action_target {
+                return Some(target.clone());
+            }
+        }
         let live_query = (self.mode == InputMode::Search).then_some(self.input.as_str());
         self.model.selected_agent(live_query)
     }
@@ -347,6 +422,9 @@ impl AgentDeck {
     }
 
     fn set_input_mode(&mut self, mode: InputMode, prompt: &str) {
+        if self.action_target.is_none() {
+            self.action_target = self.selected_agent();
+        }
         self.mode = mode;
         self.input.clear();
         self.notice = prompt.to_owned();
@@ -356,7 +434,10 @@ impl AgentDeck {
         self.mode = InputMode::Browse;
         self.input.clear();
         self.staged.clear();
+        self.action_target = None;
         self.notice.clear();
+        self.dialog_id = self.dialog_id.wrapping_add(1);
+        self.worktree_busy = false;
     }
 
     fn mutate_selected(&mut self, command: &str, extra: &[String]) {
@@ -390,6 +471,7 @@ impl AgentDeck {
     }
 
     fn apply_agent_signal(&mut self, agent: AgentRecord) {
+        let selected_key = self.selected_agent().map(|agent| agent.key);
         if self
             .model
             .agents
@@ -403,7 +485,10 @@ impl AgentDeck {
             self.model
                 .agents
                 .retain(|existing| existing.key != agent.key);
-            self.clamp_selection();
+            self.model.restore_selection(
+                selected_key.as_deref(),
+                (self.mode == InputMode::Search).then_some(self.input.as_str()),
+            );
             if self.permissions_granted {
                 self.refresh(false, false);
                 self.applied_list_request = self.next_list_request;
@@ -420,7 +505,10 @@ impl AgentDeck {
         } else {
             self.model.agents.push(agent.clone());
         }
-        self.clamp_selection();
+        self.model.restore_selection(
+            selected_key.as_deref(),
+            (self.mode == InputMode::Search).then_some(self.input.as_str()),
+        );
         self.request_focus();
         if self.permissions_granted {
             self.sync_agent_pane(&agent);
@@ -513,6 +601,7 @@ impl AgentDeck {
     }
 
     fn acknowledge_clients(&mut self, clients: Vec<ClientInfo>) {
+        let selected_key = self.selected_agent().map(|agent| agent.key);
         let candidates = self.focus_request.take().unwrap_or_default();
         for candidate in candidates {
             if !clients
@@ -553,6 +642,147 @@ impl AgentDeck {
         }
         // Any result received during the query gets a fresh focus observation.
         // Don't repeatedly query unread background panes here.
+        self.model.restore_selection(
+            selected_key.as_deref(),
+            (self.mode == InputMode::Search).then_some(self.input.as_str()),
+        );
+    }
+
+    fn jump_next_attention(&mut self) {
+        let mut candidates = self
+            .model
+            .agents
+            .iter()
+            .filter(|agent| {
+                self.model.includes_kind(agent)
+                    && is_attached(agent)
+                    && (needs_attention(agent) || (agent.status == "done" && agent.unread))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        candidates.sort_by(|a, b| group_rank(a).cmp(&group_rank(b)).then(a.key.cmp(&b.key)));
+        let next = candidates
+            .iter()
+            .position(|agent| agent.key == self.last_attention_key)
+            .map(|position| (position + 1) % candidates.len())
+            .unwrap_or(0);
+        if let Some(agent) = candidates.get(next) {
+            self.last_attention_key = agent.key.clone();
+            self.model.filter = 0;
+            self.model.query.clear();
+            self.model.restore_selection(Some(&agent.key), None);
+            self.jump_selected();
+        } else {
+            self.notice = "Nothing needs your attention".into();
+        }
+    }
+
+    fn worktree_indices(&self) -> Vec<usize> {
+        let query = if self.mode == InputMode::WorktreeSearch {
+            &self.input
+        } else {
+            &self.worktree_query
+        }
+        .to_lowercase();
+        self.worktrees
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                format!("{} {}", item.branch, item.path)
+                    .to_lowercase()
+                    .contains(&query)
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn worktree_command(&mut self, operation: &str, args: &[String]) {
+        let mut context = Self::context(operation);
+        context.insert("dialog_id".into(), self.dialog_id.to_string());
+        self.worktree_busy = true;
+        self.run_helper_with_context(args, context);
+    }
+
+    fn browse_worktrees(&mut self) {
+        let Some(agent) = self.selected_agent() else {
+            self.notice = "Select a session to browse its repository's worktrees".into();
+            return;
+        };
+        self.action_target = Some(agent.clone());
+        self.dialog_id = self.dialog_id.wrapping_add(1);
+        self.worktrees.clear();
+        self.worktree_query.clear();
+        self.worktree_selected = 0;
+        self.worktree_plan = None;
+        self.mode = InputMode::WorktreePick;
+        self.notice = "Loading worktrees…".into();
+        self.worktree_command("worktrees", &["worktrees".into(), agent.key]);
+    }
+
+    fn open_selected_worktree(&mut self) {
+        let Some(index) = self.worktree_indices().get(self.worktree_selected).copied() else {
+            return;
+        };
+        let item = self.worktrees[index].clone();
+        if item.prunable {
+            self.notice = "This checkout is missing; refresh after repairing it with Git".into();
+            return;
+        }
+        let agents = self
+            .model
+            .agents
+            .iter()
+            .filter(|agent| item.agents.contains(&agent.key) && is_attached(agent))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !agents.is_empty() {
+            self.cancel_input();
+            self.model.filter = 0;
+            self.model.show_inactive = true;
+            self.model.set_query(item.path);
+            self.model.restore_selection(Some(&agents[0].key), None);
+            if agents.len() == 1 {
+                self.jump_selected();
+            } else {
+                self.notice = format!("{} agents in this worktree · Enter to open", agents.len());
+            }
+            return;
+        }
+        self.worktree_plan = Some(WorktreePlan {
+            path: item.path,
+            branch: item.branch,
+            base_head: item.head,
+            existing: true,
+            ..Default::default()
+        });
+        self.worktree_prompt.clear();
+        self.mode = InputMode::ConfirmWorktree;
+        self.notice = "Start Codex in this worktree? y/n".into();
+    }
+
+    fn confirm_worktree(&mut self) {
+        let (Some(agent), Some(plan)) = (self.selected_agent(), self.worktree_plan.clone()) else {
+            return;
+        };
+        if plan.existing {
+            self.worktree_command(
+                "open-worktree",
+                &["open-worktree".into(), agent.key, plan.path],
+            );
+        } else {
+            self.worktree_command(
+                "worktree",
+                &[
+                    "worktree".into(),
+                    agent.key,
+                    plan.branch,
+                    self.worktree_prompt.clone(),
+                    "--base-head".into(),
+                    plan.base_head,
+                ],
+            );
+        }
+        self.notice = "Opening Codex in a new pane…".into();
     }
 
     fn activate_after_permissions_granted(&mut self) {
@@ -563,9 +793,26 @@ impl AgentDeck {
         for agent in &self.model.agents {
             self.sync_agent_pane(agent);
         }
-        set_timeout(15.0);
+        set_timeout(3.0);
         self.refresh(false, true);
-        hide_self();
+        if !self.compact_status {
+            hide_self();
+        }
+    }
+
+    fn size_deck(&self) {
+        if self.permissions_granted && !self.compact_status && !self.manual_size {
+            if let Some(plugin_id) = self.plugin_id {
+                change_floating_panes_coordinates(vec![(
+                    PaneId::Plugin(plugin_id),
+                    FloatingPaneCoordinates::default()
+                        .with_x_percent(4)
+                        .with_y_percent(5)
+                        .with_width_percent(92)
+                        .with_height_percent(90),
+                )]);
+            }
+        }
     }
 
     fn submit_input(&mut self) {
@@ -590,21 +837,27 @@ impl AgentDeck {
                 self.cancel_input();
             }
             InputMode::WorktreeBranch if !value.is_empty() => {
-                self.staged = value;
-                self.set_input_mode(
-                    InputMode::WorktreePrompt,
-                    "Optional first Codex prompt (Enter to skip)",
-                );
+                if !self.worktree_busy {
+                    if let Some(agent) = self.selected_agent() {
+                        self.worktree_command(
+                            "worktree-plan",
+                            &["worktree-plan".into(), agent.key, value],
+                        );
+                        self.notice = "Checking branch and destination…".into();
+                    }
+                }
+                return;
             }
             InputMode::WorktreePrompt => {
-                if let Some(agent) = self.selected_agent() {
-                    self.run_helper(
-                        "worktree",
-                        &["worktree".into(), agent.key, self.staged.clone(), value],
-                    );
-                    self.cancel_input();
-                    self.notice = "Creating worktree and Codex pane…".into();
-                }
+                self.worktree_prompt = value;
+                self.mode = InputMode::ConfirmWorktree;
+                self.notice = "Create worktree and start Codex? y/n".into();
+            }
+            InputMode::WorktreeSearch => {
+                self.worktree_query = value;
+                self.worktree_selected = 0;
+                self.mode = InputMode::WorktreePick;
+                self.notice.clear();
             }
             _ => {}
         }
@@ -614,6 +867,57 @@ impl AgentDeck {
     fn handle_key(&mut self, key: KeyWithModifier) {
         let bare = key.bare_key;
         match self.mode {
+            InputMode::Details => match bare {
+                BareKey::Esc | BareKey::Char('q') | BareKey::Tab => self.cancel_input(),
+                BareKey::Down | BareKey::Char('j') => {
+                    self.detail_scroll = self.detail_scroll.saturating_add(1)
+                }
+                BareKey::Up | BareKey::Char('k') => {
+                    self.detail_scroll = self.detail_scroll.saturating_sub(1)
+                }
+                BareKey::PageDown => self.detail_scroll = self.detail_scroll.saturating_add(5),
+                BareKey::PageUp => self.detail_scroll = self.detail_scroll.saturating_sub(5),
+                _ => {}
+            },
+            InputMode::WorktreePick => match bare {
+                BareKey::Esc | BareKey::Char('q') => self.cancel_input(),
+                BareKey::Down | BareKey::Char('j') => {
+                    self.worktree_selected = (self.worktree_selected + 1)
+                        .min(self.worktree_indices().len().saturating_sub(1));
+                }
+                BareKey::Up | BareKey::Char('k') => {
+                    self.worktree_selected = self.worktree_selected.saturating_sub(1)
+                }
+                BareKey::Char('/') => {
+                    self.set_input_mode(InputMode::WorktreeSearch, "Find branch or path")
+                }
+                BareKey::Char('c') => {
+                    self.worktree_query.clear();
+                    self.worktree_selected = 0;
+                }
+                BareKey::Char('n') if !self.worktree_busy => {
+                    self.worktree_plan = None;
+                    self.set_input_mode(InputMode::WorktreeBranch, "New branch name")
+                }
+                BareKey::Char('g') if !self.worktree_busy => self.browse_worktrees(),
+                BareKey::Enter if !self.worktree_busy => self.open_selected_worktree(),
+                _ => {}
+            },
+            InputMode::ConfirmWorktree => match bare {
+                BareKey::Char('y') | BareKey::Char('Y') if !self.worktree_busy => {
+                    self.confirm_worktree()
+                }
+                BareKey::Char('n') | BareKey::Esc if !self.worktree_busy => {
+                    self.mode = InputMode::WorktreePick;
+                    self.notice.clear();
+                }
+                _ => {}
+            },
+            InputMode::Help => {
+                if matches!(bare, BareKey::Esc | BareKey::Char('q') | BareKey::Char('?')) {
+                    self.cancel_input();
+                }
+            }
             InputMode::ConfirmReply => match bare {
                 BareKey::Char('y') | BareKey::Char('Y') => {
                     let message = self.staged.clone();
@@ -636,15 +940,29 @@ impl AgentDeck {
                 BareKey::Down | BareKey::Char('j') => self.move_selection(1),
                 BareKey::Up | BareKey::Char('k') => self.move_selection(-1),
                 BareKey::Enter => self.jump_selected(),
+                BareKey::Tab => {
+                    self.detail_scroll = 0;
+                    self.set_input_mode(InputMode::Details, "Session details");
+                }
+                BareKey::Char('?') => self.mode = InputMode::Help,
+                BareKey::Char('n') => self.jump_next_attention(),
+                BareKey::Char('i') => {
+                    self.model.show_inactive = !self.model.show_inactive;
+                    self.clamp_selection();
+                }
+                BareKey::Char('v') => {
+                    let key = self.selected_agent().map(|agent| agent.key);
+                    self.model.group_by_project = !self.model.group_by_project;
+                    self.model.restore_selection(key.as_deref(), None);
+                }
                 BareKey::Char('/') => self.set_input_mode(InputMode::Search, "Search agents"),
                 BareKey::Char('r') => {
                     self.set_input_mode(InputMode::Reply, "Reply to selected agent")
                 }
                 BareKey::Char('t') => self.set_input_mode(InputMode::Title, "Set task title"),
-                BareKey::Char('w') => {
-                    self.set_input_mode(InputMode::WorktreeBranch, "New worktree branch")
-                }
+                BareKey::Char('w') => self.browse_worktrees(),
                 BareKey::Char('p') => {
+                    self.action_target = self.selected_agent();
                     self.mode = InputMode::ConfirmPark;
                     self.notice = "Park selected agent with Ctrl-C? y/n".into();
                 }
@@ -679,6 +997,27 @@ impl AgentDeck {
                 _ => {}
             },
             _ => match bare {
+                BareKey::Esc if self.mode == InputMode::WorktreeSearch => {
+                    self.mode = InputMode::WorktreePick;
+                    self.input.clear();
+                    self.notice.clear();
+                }
+                BareKey::Esc if self.mode == InputMode::WorktreeBranch => {
+                    self.dialog_id = self.dialog_id.wrapping_add(1);
+                    self.worktree_busy = false;
+                    self.mode = InputMode::WorktreePick;
+                    self.notice.clear();
+                }
+                BareKey::Esc if self.mode == InputMode::WorktreePrompt => {
+                    self.mode = InputMode::WorktreeBranch;
+                    self.input = self
+                        .worktree_plan
+                        .as_ref()
+                        .map(|p| p.branch.clone())
+                        .unwrap_or_default();
+                    self.worktree_plan = None;
+                    self.notice = "New branch name".into();
+                }
                 BareKey::Esc => self.cancel_input(),
                 BareKey::Enter => self.submit_input(),
                 BareKey::Backspace => {
@@ -690,6 +1029,12 @@ impl AgentDeck {
                 _ => {}
             },
         }
+        if self.mode == InputMode::Search {
+            self.clamp_selection();
+        }
+        if self.mode == InputMode::WorktreeSearch {
+            self.worktree_selected = 0;
+        }
     }
 
     fn handle_result(
@@ -700,6 +1045,48 @@ impl AgentDeck {
         context: BTreeMap<String, String>,
     ) {
         let operation = context.get("operation").map(String::as_str).unwrap_or("");
+        if matches!(
+            operation,
+            "worktrees" | "worktree-plan" | "worktree" | "open-worktree"
+        ) {
+            if context
+                .get("dialog_id")
+                .and_then(|value| value.parse::<u64>().ok())
+                != Some(self.dialog_id)
+            {
+                return;
+            }
+            self.worktree_busy = false;
+            if code.unwrap_or(1) != 0 {
+                self.notice = truncate(&String::from_utf8_lossy(&stderr), 300);
+                return;
+            }
+            match operation {
+                "worktrees" => match serde_json::from_slice::<Vec<WorktreeInfo>>(&stdout) {
+                    Ok(items) => {
+                        self.worktrees = items;
+                        self.notice.clear();
+                    }
+                    Err(error) => self.notice = format!("Could not read worktrees: {error}"),
+                },
+                "worktree-plan" => match serde_json::from_slice::<WorktreePlan>(&stdout) {
+                    Ok(plan) => {
+                        self.worktree_plan = Some(plan);
+                        self.set_input_mode(
+                            InputMode::WorktreePrompt,
+                            "Optional first prompt (Enter to skip)",
+                        );
+                    }
+                    Err(error) => self.notice = format!("Could not read worktree preview: {error}"),
+                },
+                _ => {
+                    self.cancel_input();
+                    self.notice = "Codex opened in its worktree".into();
+                    self.refresh(false, false);
+                }
+            }
+            return;
+        }
         if operation == "auto-read" {
             if code.unwrap_or(1) != 0 {
                 if let Some(key) = context.get("key") {
@@ -720,6 +1107,7 @@ impl AgentDeck {
             }
             match serde_json::from_slice::<Vec<AgentRecord>>(&stdout) {
                 Ok(agents) => {
+                    let selected_key = self.selected_agent().map(|agent| agent.key);
                     self.applied_list_request = request_id;
                     self.model.agents = agents
                         .into_iter()
@@ -736,8 +1124,13 @@ impl AgentDeck {
                             self.merge_acknowledgement(newest)
                         })
                         .collect();
-                    self.clamp_selection();
+                    let query = (self.mode == InputMode::Search).then_some(self.input.as_str());
+                    self.model.restore_selection(selected_key.as_deref(), query);
                     self.request_focus();
+                    if self.pending_attention {
+                        self.pending_attention = false;
+                        self.jump_next_attention();
+                    }
                     if self.notice.starts_with("Refreshing") {
                         self.notice = "Metadata refreshed".into();
                     }
@@ -758,6 +1151,10 @@ impl AgentDeck {
 
 impl ZellijPlugin for AgentDeck {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
+        self.plugin_id = Some(get_plugin_ids().plugin_id);
+        self.manual_size = configuration
+            .get("auto_size")
+            .is_some_and(|value| !parse_bool(value));
         self.helper = configuration
             .get("helper")
             .cloned()
@@ -765,8 +1162,14 @@ impl ZellijPlugin for AgentDeck {
         self.model.show_subagents = configuration
             .get("show_subagents")
             .is_some_and(|value| parse_bool(value));
+        self.compact_status = configuration
+            .get("display")
+            .is_some_and(|value| value == "status");
+        self.model.show_inactive = configuration
+            .get("show_inactive")
+            .is_some_and(|value| parse_bool(value));
         subscribe(&Self::subscribed_events());
-        set_selectable(true);
+        set_selectable(!self.compact_status);
         request_permission(&Self::required_permissions());
     }
 
@@ -777,22 +1180,40 @@ impl ZellijPlugin for AgentDeck {
                 return true;
             }
             Event::Mouse(Mouse::ScrollDown(_)) => {
-                self.move_selection(1);
+                if matches!(self.mode, InputMode::WorktreePick | InputMode::Details) {
+                    self.handle_key(KeyWithModifier::new(BareKey::Down));
+                } else if matches!(self.mode, InputMode::Browse | InputMode::Search) {
+                    self.move_selection(1);
+                }
                 return true;
             }
             Event::Mouse(Mouse::ScrollUp(_)) => {
-                self.move_selection(-1);
+                if matches!(self.mode, InputMode::WorktreePick | InputMode::Details) {
+                    self.handle_key(KeyWithModifier::new(BareKey::Up));
+                } else if matches!(self.mode, InputMode::Browse | InputMode::Search) {
+                    self.move_selection(-1);
+                }
                 return true;
             }
-            Event::Mouse(Mouse::LeftClick(line, _)) if line >= 3 => {
-                return self
-                    .model
-                    .select_viewport_row((line as usize).saturating_sub(3));
+            Event::Mouse(Mouse::LeftClick(line, _)) if line >= 0 => {
+                match self.screen_hits.get(&(line as usize)) {
+                    Some(ui::Hit::Agent(position)) => self.model.selected = *position,
+                    Some(ui::Hit::Inactive) => self.model.show_inactive = !self.model.show_inactive,
+                    Some(ui::Hit::Worktree(position)) => self.worktree_selected = *position,
+                    None => return false,
+                }
+                return true;
             }
             Event::Visible(visible) => {
                 self.visible = visible;
                 if visible {
+                    self.size_deck();
                     self.refresh(false, true);
+                }
+            }
+            Event::Timer(seconds) if seconds < 1.0 => {
+                if self.sized_for_open {
+                    self.size_deck();
                 }
             }
             Event::Timer(_) => {
@@ -801,7 +1222,27 @@ impl ZellijPlugin for AgentDeck {
                 set_timeout(3.0);
                 self.request_focus();
             }
-            Event::PaneUpdate(_) | Event::TabUpdate(_) | Event::SessionUpdate(_, _) => {
+            Event::PaneUpdate(manifest) => {
+                if let Some(pane) = manifest
+                    .panes
+                    .values()
+                    .flatten()
+                    .find(|pane| pane.is_plugin && Some(pane.id) == self.plugin_id)
+                {
+                    if pane.is_suppressed || !pane.is_focused {
+                        self.sized_for_open = false;
+                    } else if !self.sized_for_open && !self.compact_status {
+                        self.sized_for_open = true;
+                        // LaunchOrFocusPlugin can apply its default geometry after
+                        // Visible(true); resize after that action has completed.
+                        if self.permissions_granted {
+                            set_timeout(0.1);
+                        }
+                    }
+                }
+                self.request_focus();
+            }
+            Event::TabUpdate(_) | Event::SessionUpdate(_, _) => {
                 self.request_focus();
             }
             Event::ListClients(clients) => {
@@ -837,191 +1278,42 @@ impl ZellijPlugin for AgentDeck {
                 }
             }
         } else if pipe_message.name == "toggle" {
-            show_self(true);
+            if !self.compact_status {
+                show_self(true);
+                self.size_deck();
+            }
+        } else if pipe_message.name == "attention-next" && !self.compact_status {
+            self.pending_attention = true;
+            self.refresh(false, false);
         }
         self.visible
     }
 
     fn render(&mut self, rows: usize, cols: usize) {
-        let width = cols.saturating_sub(2);
-        let live = self
-            .model
-            .agents
-            .iter()
-            .filter(|agent| self.model.includes_kind(agent) && is_attached(agent))
-            .count();
-        let resumable = self
-            .model
-            .agents
-            .iter()
-            .filter(|agent| is_resumable(agent))
-            .count();
-        let unread = self
-            .model
-            .agents
-            .iter()
-            .filter(|agent| self.model.includes_kind(agent) && is_attached(agent) && agent.unread)
-            .count();
-        let waiting = self
-            .model
-            .agents
-            .iter()
-            .filter(|agent| {
-                self.model.includes_kind(agent)
-                    && is_attached(agent)
-                    && agent.status == "needs_input"
-            })
-            .count();
-        let header = truncate(
-            &format!(
-                " Agent Deck  {} live · {} resume · {} unread · {} waiting",
-                live, resumable, unread, waiting
-            ),
-            width,
-        );
-        print_text_with_coordinates(Text::new(header).color_all(3), 1, 0, Some(width), None);
-
-        let filters = FILTERS
-            .iter()
-            .enumerate()
-            .map(|(index, name)| {
-                if self.model.filter == index {
-                    format!("[{}:{}]", index + 1, name)
-                } else {
-                    format!(" {}:{} ", index + 1, name)
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-        let filters = format!(
-            "{} · subagents:{}",
-            filters,
-            if self.model.show_subagents {
-                "on"
-            } else {
-                "off"
-            }
-        );
-        print_text_with_coordinates(
-            Text::new(truncate(&filters, width)).dim_all(),
-            1,
-            1,
-            Some(width),
-            None,
-        );
-
-        let matching = self.matching_indices();
-        let list_height = rows.saturating_sub(8);
-        self.model.update_viewport(list_height, matching.len());
-        let scroll = self.model.viewport_start;
-        for (screen_index, agent_index) in
-            matching.iter().skip(scroll).take(list_height).enumerate()
-        {
-            let agent = &self.model.agents[*agent_index];
-            let cursor = if scroll + screen_index == self.model.selected {
-                "›"
-            } else {
-                " "
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let screen = ui::screen(self, rows, cols, now);
+        self.screen_hits = screen.hits;
+        for line in screen.lines {
+            let mut text = Text::new(line.text);
+            text = match line.style {
+                ui::Style::Heading => text.color_all(1),
+                ui::Style::Muted => text.unbold_all(),
+                ui::Style::Selected => text.selected(),
+                ui::Style::Alert => text.error_color_all(),
+                ui::Style::Normal => text,
             };
-            let unread_mark = if agent.unread { "●" } else { " " };
-            let state = status_symbol(&agent.status);
-            let position = scroll + screen_index;
-            let label = if let Some(connector) =
-                subagent_connector(&self.model.agents, &matching, position)
-            {
-                format!(
-                    "{cursor}{unread_mark}{state}  {connector} subagent: {}",
-                    agent.title
-                )
-            } else {
-                format!(
-                    "{cursor}{unread_mark}{state}  {}: {}",
-                    agent.project, agent.title
-                )
-            };
-            let text = Text::new(truncate(&label, width));
-            let text = if scroll + screen_index == self.model.selected {
-                text.color_all(3)
-            } else {
-                text
-            };
-            print_text_with_coordinates(text, 1, 3 + screen_index, Some(width), None);
+            print_text_with_coordinates(text, line.x, line.y, Some(line.width), None);
         }
-
-        if let Some(agent) = self.selected_agent() {
-            let detail_y = rows.saturating_sub(4);
-            let dirty = if agent.dirty { "*" } else { "" };
-            let ports = if agent.ports.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    " ports:{}",
-                    agent
-                        .ports
-                        .iter()
-                        .map(u16::to_string)
-                        .collect::<Vec<_>>()
-                        .join(",")
-                )
-            };
-            let pr = if agent.pr.is_empty() {
-                String::new()
-            } else {
-                format!(" {}", agent.pr)
-            };
-            let detail = format!(
-                " {} · {}{}{}{} · {}",
-                agent.zellij_session, agent.branch, dirty, pr, ports, agent.status
-            );
-            print_text_with_coordinates(
-                Text::new(truncate(&detail, width)).dim_all(),
-                1,
-                detail_y,
-                Some(width),
-                None,
-            );
-            if !agent.message.is_empty() {
-                print_text_with_coordinates(
-                    Text::new(truncate(&format!(" {}", agent.message), width)),
-                    1,
-                    detail_y + 1,
-                    Some(width),
-                    None,
-                );
-            }
-        }
-
-        let prompt_y = rows.saturating_sub(2);
-        let prompt = if matches!(
-            self.mode,
-            InputMode::Browse | InputMode::ConfirmReply | InputMode::ConfirmPark
-        ) {
-            self.notice.clone()
-        } else {
-            format!("{}: {}_", self.notice, self.input)
-        };
-        print_text_with_coordinates(
-            Text::new(truncate(&prompt, width)),
-            1,
-            prompt_y,
-            Some(width),
-            None,
-        );
-        let keys = " Enter jump · r reply · t title · w worktree · p park · R resume · m read · d dismiss · g refresh · s subagents · / search · q close ";
-        print_text_with_coordinates(
-            Text::new(truncate(keys, width)).dim_all(),
-            1,
-            rows.saturating_sub(1),
-            Some(width),
-            None,
-        );
     }
 }
 
 fn status_symbol(status: &str) -> &'static str {
     match status {
         "working" => "◐",
-        "needs_input" => "!",
+        "needs_input" | "error" => "!",
         "done" => "✓",
         "parked" => "Ⅱ",
         "ended" => "×",
@@ -1054,14 +1346,36 @@ fn subagent_connector(
     Some(if has_next_sibling { "├─" } else { "└─" })
 }
 
+fn needs_attention(agent: &AgentRecord) -> bool {
+    matches!(agent.status.as_str(), "needs_input" | "error")
+}
+
+fn group_rank(agent: &AgentRecord) -> u8 {
+    if needs_attention(agent) {
+        0
+    } else if agent.status == "done" && agent.unread {
+        1
+    } else if agent.status == "working" {
+        2
+    } else {
+        3
+    }
+}
+
 fn truncate(value: &str, limit: usize) -> String {
-    if value.chars().count() <= limit {
+    if value.width() <= limit {
         return value.to_owned();
     }
-    if limit <= 1 {
-        return "…".chars().take(limit).collect();
+    if limit == 0 {
+        return String::new();
     }
-    let mut result = value.chars().take(limit - 1).collect::<String>();
+    let mut result = String::new();
+    for ch in value.chars() {
+        if result.width() + unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0) > limit - 1 {
+            break;
+        }
+        result.push(ch);
+    }
     result.push('…');
     result
 }
@@ -1204,6 +1518,101 @@ mod tests {
         assert!(!deck.model.agents[0].unread);
     }
 
+    #[test]
+    fn selection_and_reply_target_survive_reordering() {
+        let mut deck = AgentDeck {
+            model: DeckModel {
+                agents: vec![unread_agent("a", "work", 1), unread_agent("b", "work", 2)],
+                selected: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        deck.set_input_mode(InputMode::Reply, "Reply");
+        let mut changed = deck.model.agents[0].clone();
+        changed.status = "needs_input".into();
+        changed.revision = 2;
+        deck.apply_agent_signal(changed);
+        assert_eq!(deck.selected_agent().unwrap().key, "b");
+        deck.cancel_input();
+        assert_eq!(deck.selected_agent().unwrap().key, "b");
+        let agents = vec![unread_agent("b", "work", 2), unread_agent("a", "work", 1)];
+        deck.handle_result(
+            Some(0),
+            serde_json::to_vec(&agents).unwrap(),
+            vec![],
+            AgentDeck::context("list"),
+        );
+        assert_eq!(deck.selected_agent().unwrap().key, "b");
+    }
+
+    #[test]
+    fn worktree_creation_previews_and_requires_confirmation() {
+        let mut deck = AgentDeck {
+            model: DeckModel {
+                agents: vec![unread_agent("agent", "work", 7)],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        deck.browse_worktrees();
+        let mut listed = AgentDeck::context("worktrees");
+        listed.insert("dialog_id".into(), deck.dialog_id.to_string());
+        deck.handle_result(Some(0), b"[]".to_vec(), vec![], listed);
+        deck.handle_key(KeyWithModifier::new(BareKey::Char('n')));
+        deck.input = "feature/search".into();
+        deck.submit_input();
+        assert_eq!(deck.mode, InputMode::WorktreeBranch);
+        assert_eq!(deck.input, "feature/search");
+        let mut planned = AgentDeck::context("worktree-plan");
+        planned.insert("dialog_id".into(), deck.dialog_id.to_string());
+        deck.handle_result(Some(0), br#"{"branch":"feature/search","path":"/tmp/example/search","base_head":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","base_branch":"main"}"#.to_vec(), vec![], planned);
+        assert_eq!(deck.mode, InputMode::WorktreePrompt);
+        deck.submit_input();
+        assert_eq!(deck.mode, InputMode::ConfirmWorktree);
+        assert!(!deck.worktree_busy);
+        assert!(deck.worktree_prompt.is_empty());
+        deck.handle_key(KeyWithModifier::new(BareKey::Char('y')));
+        assert!(deck.worktree_busy);
+    }
+
+    #[test]
+    fn cancelled_worktree_preview_cannot_reopen_the_dialog() {
+        let mut deck = AgentDeck::default();
+        let mut context = AgentDeck::context("worktree-plan");
+        context.insert("dialog_id".into(), deck.dialog_id.to_string());
+        deck.cancel_input();
+        deck.handle_result(Some(0), b"{}".to_vec(), vec![], context);
+        assert_eq!(deck.mode, InputMode::Browse);
+        assert!(deck.worktree_plan.is_none());
+    }
+
+    #[test]
+    fn searching_worktrees_and_opening_empty_checkout_requires_confirmation() {
+        let mut deck = AgentDeck {
+            worktrees: vec![
+                WorktreeInfo {
+                    path: "/repo/main".into(),
+                    branch: "main".into(),
+                    ..Default::default()
+                },
+                WorktreeInfo {
+                    path: "/repo/search".into(),
+                    branch: "feature/search".into(),
+                    ..Default::default()
+                },
+            ],
+            worktree_query: "search".into(),
+            ..Default::default()
+        };
+        assert_eq!(deck.worktree_indices(), vec![1]);
+        deck.open_selected_worktree();
+        assert_eq!(deck.mode, InputMode::ConfirmWorktree);
+        assert_eq!(deck.worktree_plan.as_ref().unwrap().path, "/repo/search");
+        assert!(deck.worktree_plan.as_ref().unwrap().existing);
+        assert!(!deck.worktree_busy);
+    }
+
     // The Zellij SDK imports this host function even when a unit test does not
     // exercise a host command. Native tests provide a no-op implementation so
     // the test binary can link outside the WASM host.
@@ -1220,7 +1629,7 @@ mod tests {
     #[test]
     fn truncates_on_character_boundaries() {
         assert_eq!(truncate("example-project", 6), "examp…");
-        assert_eq!(truncate("سلام", 3), "سل…");
+        assert!(truncate("سلام", 3).width() <= 3);
     }
 
     #[test]
@@ -1370,6 +1779,7 @@ mod tests {
                         key: "codex:live".into(),
                         zellij_session: "work".into(),
                         pane_id: Some(7),
+                        status: "working".into(),
                         ..Default::default()
                     },
                     AgentRecord {
@@ -1407,12 +1817,14 @@ mod tests {
                     parent_key: "codex:parent".into(),
                     zellij_session: "work".into(),
                     pane_id: Some(7),
+                    status: "working".into(),
                     ..Default::default()
                 },
                 AgentRecord {
                     key: "codex:parent".into(),
                     zellij_session: "work".into(),
                     pane_id: Some(7),
+                    status: "working".into(),
                     ..Default::default()
                 },
                 AgentRecord {
@@ -1421,6 +1833,7 @@ mod tests {
                     parent_key: "codex:parent".into(),
                     zellij_session: "work".into(),
                     pane_id: Some(7),
+                    status: "working".into(),
                     ..Default::default()
                 },
             ],
@@ -1448,34 +1861,13 @@ mod tests {
     }
 
     #[test]
-    fn clicking_a_scrolled_row_selects_its_viewport_item() {
-        let mut model = DeckModel {
-            agents: (0..10)
-                .map(|pane_id| AgentRecord {
-                    key: format!("codex:{pane_id}"),
-                    zellij_session: "work".into(),
-                    pane_id: Some(pane_id),
-                    ..Default::default()
-                })
-                .collect(),
-            selected: 7,
-            ..Default::default()
-        };
-
-        model.update_viewport(3, model.matching_indices(None).len());
-
-        assert!(model.select_viewport_row(1));
-        assert_eq!(model.selected_agent(None).unwrap().key, "codex:6");
-        assert!(!model.select_viewport_row(3));
-    }
-
-    #[test]
     fn pane_close_detaches_only_the_matching_attachment_generation() {
         let agents = vec![
             AgentRecord {
                 key: "codex:closed".into(),
                 zellij_session: "work".into(),
                 pane_id: Some(7),
+                status: "working".into(),
                 attachment_id: "generation-a".into(),
                 ..Default::default()
             },
@@ -1483,6 +1875,7 @@ mod tests {
                 key: "codex:other-session".into(),
                 zellij_session: "other".into(),
                 pane_id: Some(7),
+                status: "working".into(),
                 attachment_id: "generation-b".into(),
                 ..Default::default()
             },

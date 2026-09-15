@@ -76,6 +76,8 @@ class RecordStore:
         "cwd",
         "project",
         "project_root",
+        "repository_root",
+        "worktree",
         "title",
         "status",
         "message",
@@ -347,9 +349,16 @@ def project_metadata(cwd: str, timeout: float = 1.5) -> dict[str, Any]:
             "cwd": str(Path(cwd).resolve()),
             "project": clean(project, 48),
             "project_root": clean(project_root, 512),
+            "repository_root": clean(project_root, 512),
+            "worktree": "",
             "branch": "",
             "dirty": False,
         }
+    common = git_output(
+        cwd, "rev-parse", "--path-format=absolute", "--git-common-dir", timeout=timeout
+    )
+    common_path = Path(common) if common else Path(root) / ".git"
+    repository = common_path.parent if common_path.name == ".git" else common_path
     branch = git_output(cwd, "branch", "--show-current", timeout=timeout)
     if not branch:
         branch = git_output(cwd, "rev-parse", "--short", "HEAD", timeout=timeout)
@@ -358,8 +367,10 @@ def project_metadata(cwd: str, timeout: float = 1.5) -> dict[str, Any]:
     )
     return {
         "cwd": str(Path(cwd).resolve()),
-        "project": clean(project, 48),
+        "project": clean(repository.name, 48),
         "project_root": clean(project_root, 512),
+        "repository_root": clean(str(repository), 512),
+        "worktree": "main" if Path(root) == repository else clean(Path(root).name, 80),
         "branch": clean(branch, 80),
         "dirty": dirty,
     }
@@ -406,7 +417,7 @@ def generated_title(payload: dict[str, Any]) -> str:
 
 
 def pane_number(value: Any) -> int | None:
-    match = re.search(r"(\d+)$", str(value or ""))
+    match = re.search(r"(\d+)$", str(value if value is not None else ""))
     return int(match.group(1)) if match else None
 
 
@@ -1028,7 +1039,7 @@ def slug(value: str) -> str:
     return result[:48] or "agent"
 
 
-def do_worktree(record: dict[str, Any], branch: str, prompt: str) -> dict[str, str]:
+def worktree_plan(record: dict[str, Any], branch: str) -> dict[str, str]:
     if not SAFE_BRANCH.fullmatch(branch) or ".." in branch or branch.endswith("/"):
         raise SystemExit("invalid branch name")
     root = record.get("project_root")
@@ -1046,15 +1057,59 @@ def do_worktree(record: dict[str, Any], branch: str, prompt: str) -> dict[str, s
     )
     main_root = common_path.parent if common_path.name == ".git" else Path(root)
     worktree = main_root.parent / ".worktrees" / main_root.name / slug(branch)
-    worktree.parent.mkdir(parents=True, exist_ok=True)
-    result = subprocess.run(
-        ["git", "-C", root, "worktree", "add", "-b", branch, str(worktree)],
-        text=True,
-        capture_output=True,
-    )
-    if result.returncode != 0:
-        raise SystemExit(clean(result.stderr or result.stdout, 300))
+    if worktree.exists():
+        raise SystemExit("Worktree destination already exists; open it from the worktree picker")
+    if git_output(root, "show-ref", "--verify", f"refs/heads/{branch}"):
+        raise SystemExit("Branch already exists; choose a new branch name")
+    return {
+        "branch": branch,
+        "path": str(worktree),
+        "base_head": git_output(root, "rev-parse", "HEAD"),
+        "base_branch": git_output(root, "branch", "--show-current") or "detached HEAD",
+        "repository": str(main_root),
+    }
+
+
+def worktrees(record: dict[str, Any]) -> list[dict[str, Any]]:
+    root = str(record.get("project_root") or record.get("cwd") or "")
+    result = run(["git", "-C", root, "worktree", "list", "--porcelain", "-z"])
+    if result.returncode:
+        raise SystemExit("This session is not in a Git repository")
+    items: list[dict[str, Any]] = []
+    current: dict[str, Any] = {}
+    for field in result.stdout.split("\0"):
+        if not field:
+            if current and not current.get("bare"):
+                items.append(current)
+            current = {}
+            continue
+        name, _, value = field.partition(" ")
+        if name == "worktree":
+            current = {"path": value, "branch": "detached HEAD", "locked": False, "prunable": False}
+        elif name == "branch":
+            current["branch"] = value.removeprefix("refs/heads/")
+        elif name == "HEAD":
+            current["head"] = value
+        elif name in {"locked", "prunable", "bare"}:
+            current[name] = True
+    live = records()
+    for item in items:
+        item["current"] = item["path"] == record.get("project_root")
+        item["agents"] = [
+            agent["key"]
+            for agent in live
+            if agent.get("project_root") == item["path"]
+            and agent.get("pane_id") is not None
+            and agent.get("zellij_session")
+            and agent.get("kind") == "codex"
+        ]
+    return sorted(items, key=lambda item: (not item["current"], item["branch"], item["path"]))
+
+
+def launch_worktree(record: dict[str, Any], path: str, branch: str, prompt: str = "") -> None:
     session = record.get("zellij_session") or clean(os.environ.get("ZELLIJ_SESSION_NAME"), 128)
+    if not session:
+        raise SystemExit("No Zellij session is available")
     command = [
         "zellij",
         "--session",
@@ -1062,15 +1117,50 @@ def do_worktree(record: dict[str, Any], branch: str, prompt: str) -> dict[str, s
         "action",
         "new-pane",
         "--cwd",
-        str(worktree),
+        path,
         "--name",
-        f"{main_root.name}: {branch}",
+        f"{record.get('project', 'Codex')}: {branch}",
         "--",
-        *codex_command(record, "-C", str(worktree)),
+        *codex_command(record, "-C", path),
     ]
     if prompt:
         command.append(prompt)
-    subprocess.run(command, check=True)
+    try:
+        subprocess.run(command, check=True)
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise SystemExit(
+            f"Checkout remains at {path}; could not open a Codex pane: {error}"
+        ) from None
+
+
+def open_worktree(record: dict[str, Any], path: str) -> dict[str, str]:
+    item = next((item for item in worktrees(record) if item["path"] == path), None)
+    if not item or item["prunable"] or not Path(path).is_dir():
+        raise SystemExit("Worktree is no longer available; refresh the picker")
+    if item["agents"]:
+        raise SystemExit("A live agent already uses this worktree; refresh the picker to open it")
+    launch_worktree(record, path, item["branch"])
+    return {"path": path, "branch": item["branch"]}
+
+
+def do_worktree(
+    record: dict[str, Any], branch: str, prompt: str, base_head: str = ""
+) -> dict[str, str]:
+    plan = worktree_plan(record, branch)
+    root = record["project_root"]
+    worktree = Path(plan["path"])
+    base_head = base_head or plan["base_head"]
+    if not re.fullmatch(r"[0-9a-f]{40,64}", base_head):
+        raise SystemExit("Cannot resolve the base commit")
+    worktree.parent.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        ["git", "-C", root, "worktree", "add", "-b", branch, str(worktree), base_head],
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise SystemExit(clean(result.stderr or result.stdout, 300))
+    launch_worktree(record, str(worktree), branch, prompt)
     return {"branch": branch, "path": str(worktree)}
 
 
@@ -1151,6 +1241,15 @@ def parser() -> argparse.ArgumentParser:
     worktree.add_argument("key")
     worktree.add_argument("branch")
     worktree.add_argument("prompt", nargs="?", default="")
+    worktree.add_argument("--base-head", default="")
+    listing_worktrees = sub.add_parser("worktrees")
+    listing_worktrees.add_argument("key")
+    planning = sub.add_parser("worktree-plan")
+    planning.add_argument("key")
+    planning.add_argument("branch")
+    opening = sub.add_parser("open-worktree")
+    opening.add_argument("key")
+    opening.add_argument("path")
     detach = sub.add_parser("detach-pane")
     detach.add_argument("key")
     detach.add_argument("attachment_id")
@@ -1185,7 +1284,17 @@ def main() -> None:
     elif args.command == "resume":
         do_resume(lookup(args.key), args.fallback_session)
     elif args.command == "worktree":
-        print(json.dumps(do_worktree(lookup(args.key), args.branch, clean(args.prompt, 2000))))
+        print(
+            json.dumps(
+                do_worktree(lookup(args.key), args.branch, clean(args.prompt, 2000), args.base_head)
+            )
+        )
+    elif args.command == "worktrees":
+        print(json.dumps(worktrees(lookup(args.key))))
+    elif args.command == "worktree-plan":
+        print(json.dumps(worktree_plan(lookup(args.key), args.branch)))
+    elif args.command == "open-worktree":
+        print(json.dumps(open_worktree(lookup(args.key), args.path)))
     elif args.command == "detach-pane":
         print(json.dumps(detach_attachment(args.key, args.attachment_id)))
 

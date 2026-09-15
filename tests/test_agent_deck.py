@@ -20,12 +20,15 @@ class AgentDeckTest(unittest.TestCase):
         self.env = patch.dict(
             os.environ,
             {
+                # Commit hooks export Git repository/index variables. Temporary
+                # Git fixtures must never inherit the invoking repository.
+                **{key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
                 "ZELLIJ_AGENT_DECK_STATE_DIR": self.temp.name,
                 "ZELLIJ_SESSION_NAME": "dev",
                 "ZELLIJ_PANE_ID": "7",
                 "CODEX_HOME": str(self.codex_home),
             },
-            clear=False,
+            clear=True,
         )
         self.env.start()
         self.pipe = patch.object(deck, "pipe_event")
@@ -55,6 +58,14 @@ class AgentDeckTest(unittest.TestCase):
         self.assertEqual((waiting["status"], waiting["unread"]), ("needs_input", True))
         done = self.event("Stop", last_assistant_message="Implemented it")
         self.assertEqual((done["status"], done["message"]), ("done", "Implemented it"))
+
+    def test_zero_numbered_terminal_is_preserved_by_reconciliation(self):
+        with patch.dict(os.environ, {"ZELLIJ_PANE_ID": "0"}):
+            record = self.event("SessionStart")
+        result = deck.subprocess.CompletedProcess([], 0, '[{"id":0,"is_plugin":false}]', "")
+        with patch.object(deck, "run", return_value=result):
+            self.assertEqual(deck.zellij_panes("dev"), {0})
+        self.assertEqual(record["pane_id"], 0)
 
     def test_acknowledgement_cannot_clear_a_newer_result_or_attachment(self):
         first = self.event("Stop", last_assistant_message="First result")
@@ -465,8 +476,16 @@ class AgentDeckTest(unittest.TestCase):
             "launcher_prefix": ["command-wrapper", "--quiet"],
         }
         completed = deck.subprocess.CompletedProcess([], 0, "", "")
+
+        def git_value(_cwd, *args, **_kwargs):
+            if "--git-common-dir" in args:
+                return str(root / ".git")
+            if args == ("rev-parse", "HEAD"):
+                return "a" * 40
+            return ""
+
         with (
-            patch.object(deck, "git_output", return_value=str(root / ".git")),
+            patch.object(deck, "git_output", side_effect=git_value),
             patch.object(deck.subprocess, "run", return_value=completed) as run,
         ):
             deck.do_worktree(record, "feature/prefix", "start here")
@@ -484,6 +503,66 @@ class AgentDeckTest(unittest.TestCase):
                 "start here",
             ],
         )
+
+    def test_real_worktrees_share_repository_identity_and_have_distinct_branches(self):
+        root = Path(self.temp.name) / "repository"
+        root.mkdir()
+
+        def git(*args):
+            return deck.subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-C",
+                    str(root),
+                    *args,
+                ],
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+
+        git("init", "-b", "main")
+        git("commit", "--allow-empty", "-m", "Initial")
+        other = Path(self.temp.name) / "feature checkout"
+        git("worktree", "add", "-b", "feature/search", str(other))
+        main = deck.project_metadata(str(root))
+        linked = deck.project_metadata(str(other))
+        self.assertEqual(main["project"], linked["project"])
+        self.assertEqual(main["repository_root"], linked["repository_root"])
+        self.assertEqual(linked["worktree"], "feature checkout")
+        self.assertEqual(linked["branch"], "feature/search")
+        self.assertNotEqual(main["project_root"], linked["project_root"])
+        record = self.event("SessionStart", cwd=str(other))
+        entries = deck.worktrees(record)
+        self.assertEqual(len(entries), 2)
+        self.assertTrue(entries[0]["current"])
+        self.assertEqual(entries[0]["agents"], [record["key"]])
+        with self.assertRaisesRegex(SystemExit, "live agent"):
+            deck.open_worktree(record, str(other))
+        with patch.object(deck, "launch_worktree") as launch:
+            deck.open_worktree(record, str(root))
+            launch.assert_called_once_with(record, str(root), "main")
+        with self.assertRaisesRegex(SystemExit, "no longer available"):
+            deck.open_worktree(record, self.temp.name)
+        plan = deck.worktree_plan(record, "feature/new")
+        self.assertEqual(plan["base_branch"], "feature/search")
+        self.assertFalse(Path(plan["path"]).exists())
+        with self.assertRaisesRegex(SystemExit, "Branch already exists"):
+            deck.worktree_plan(record, "main")
+        with patch.object(deck, "launch_worktree") as launch:
+            result = deck.do_worktree(record, "feature/new", "", plan["base_head"])
+            self.assertTrue(Path(result["path"]).is_dir())
+            launch.assert_called_once()
+        with self.assertRaisesRegex(SystemExit, "destination already exists"):
+            deck.worktree_plan(record, "feature/new")
 
     def test_git_timeout_degrades_to_empty_metadata(self):
         with patch.object(deck, "run", side_effect=deck.subprocess.TimeoutExpired("git", 1.5)):

@@ -51,6 +51,7 @@ rustPlatform.buildRustPackage {
     install -Dm755 codex_resurrection.py $out/bin/zellij-agent-deck-codex
     install -Dm644 examples/hooks.json $out/share/doc/zellij-agent-deck/examples/hooks.json
     install -Dm644 examples/zellij.kdl $out/share/doc/zellij-agent-deck/examples/zellij.kdl
+    install -Dm644 examples/status-layout.kdl $out/share/doc/zellij-agent-deck/examples/status-layout.kdl
     substituteInPlace $out/bin/zellij-agent-deck $out/bin/zellij-agent-deck-codex \
       --replace-fail '#!/usr/bin/env python3' '#!${python3}/bin/python3'
     wrapProgram $out/bin/zellij-agent-deck \
@@ -72,6 +73,7 @@ rustPlatform.buildRustPackage {
     PATH=/path-that-does-not-exist $out/bin/zellij-agent-deck-codex --help >/dev/null
     test -f $out/share/doc/zellij-agent-deck/examples/hooks.json
     test -f $out/share/doc/zellij-agent-deck/examples/zellij.kdl
+    test -f $out/share/doc/zellij-agent-deck/examples/status-layout.kdl
   '';
 
   meta = {

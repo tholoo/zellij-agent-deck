@@ -7,6 +7,12 @@ is based on Keep a Changelog, and the project follows Semantic Versioning.
 
 ### Added
 
+- Two-line session rows, explicit statuses, attention groups, repository grouping,
+  searchable worktree identity, and scrollable session details.
+- Worktree picker for existing checkouts and agents, with a branch/path/base-commit
+  preview before creating a new worktree and opening Codex.
+- Next-attention navigation, contextual help, and an optional one-line status layout.
+
 - Passive tool activity, explicit tool failures, and independent status/activity ages.
 
 - Codex 0.150 generated thread names as Agent Deck titles, while preserving
@@ -27,6 +33,9 @@ is based on Keep a Changelog, and the project follows Semantic Versioning.
 
 ### Fixed
 
+- Preserve selected sessions and action targets when incoming updates reorder rows.
+- Keep terminal pane zero attached during pane reconciliation.
+
 - Clear unread after normal pane navigation and for results observed in a focused
   attached client, with generation checks protecting newer results and reused panes.
 - Prevent stale record updates from restoring acknowledged unread indicators.
@@ -46,6 +55,9 @@ is based on Keep a Changelog, and the project follows Semantic Versioning.
 - Select the correct agent when clicking a scrolled list.
 
 ### Changed
+
+- Automatically size the floating deck to the terminal, collapse idle/seen/parked
+  sessions by default, and use readable secondary text without dimming.
 
 - Target the Zellij 0.45.0 plugin SDK.
 - Reduce hidden-plugin polling and replace the large PNG demo with a lossless

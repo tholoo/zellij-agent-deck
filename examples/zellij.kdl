@@ -2,6 +2,7 @@ plugins {
     agent-deck location="file:~/.nix-profile/share/zellij/plugins/agent-deck.wasm" {
         helper "zellij-agent-deck"
         show_subagents "false"
+        auto_size "true"
     }
 }
 
@@ -16,6 +17,12 @@ keybinds {
             LaunchOrFocusPlugin "agent-deck" {
                 floating true
                 move_to_focused_tab true
+            }
+            SwitchToMode "Normal"
+        }
+        bind "Alt n" {
+            MessagePlugin "agent-deck" {
+                name "attention-next"
             }
             SwitchToMode "Normal"
         }

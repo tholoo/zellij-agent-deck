@@ -67,6 +67,24 @@ your Zellij configuration. Update the plugin path if it is not installed in
 your Nix profile. The configuration loads one hidden plugin instance in each
 session and binds `Alt a` to show or focus the floating deck.
 
+The deck opens at 92% of the terminal width and 90% of its height. Set
+`auto_size "false"` to keep manually chosen floating-pane dimensions. The example
+also binds `Alt n` to jump directly to the next session needing attention,
+including across Zellij sessions. Existing configurations can keep their current
+bindings; `n` performs the same action inside the deck.
+
+The default view groups sessions into **Needs you**, **New results**, and
+**Working**. Idle, seen completions, and parked sessions are collapsed; press `i`
+to expand them. Explicit filters and searches include matching collapsed sessions.
+Press `v` to group by repository, including its linked worktrees. Rows show the
+task, readable status, status age, current tool or result excerpt, and branch /
+worktree identity. `*` means uncommitted changes. Wide panes add a details panel;
+`Tab` opens scrollable full details at any width. No extra model calls are made.
+
+For a persistent one-line summary, use [`examples/status-layout.kdl`](examples/status-layout.kdl)
+with the configured `agent-deck` alias. Its `display "status"` instance stays
+visible and unselectable; the floating deck remains available through `Alt a`.
+
 Subagents are hidden by default. Set `show_subagents "true"` in the
 `agent-deck` plugin configuration to show them initially. They are grouped
 beneath their parent session with tree connectors when visible.
@@ -122,15 +140,40 @@ panes and dead Zellij sessions when no Codex shutdown hook can run.
 
 ## Keys
 
-- `Enter`: jump to the exact session and pane
+- `Enter`: jump to the exact session and pane; `n`: next attention
+- `Tab`: full details; arrows / Page Up / Page Down scroll; `Esc`: back
 - `r`: compose and confirm a reply
 - `t`: override the `project: task` title
-- `w`: create a Git worktree and launch Codex in a new pane
+- `w`: browse the selected repository's worktrees; `n` in the picker creates one
 - `p`: confirm parking with Ctrl-C; `R`: resume the Codex session
 - `m`: mark read; `d`: dismiss
 - `g`: refresh branch, dirty state, GitHub PR, and listening ports
 - `s`: show or hide subagents for the current plugin instance
+- `i`: expand or collapse idle / seen / parked sessions; `v`: attention / repository view
 - `/`: search; `1`–`7`: status filters (`7` shows resumable sessions); `q`: close
+- `?`: keyboard help
+
+## Worktrees
+
+Linked worktrees share a repository identity while retaining their own branch,
+path, Git status, and sessions. Search matches branches, worktree names, full
+paths, session names, tasks, activity, and result excerpts.
+
+Press `w` on a session to list its repository's registered Git worktrees. The
+picker shows the current checkout and live agent counts. `Enter` opens the
+existing agent, or shows the agents in that checkout when there are several.
+If none are running, it offers to start Codex there. `/` searches the picker,
+`g` refreshes, and `Esc` returns.
+
+To create a checkout, press `n` in the picker and enter a new branch name. Review
+the destination and base commit, optionally enter an initial prompt, then confirm
+with `y`. The base is the selected session's checkout; creation uses the exact
+previewed commit. New checkouts go under `.worktrees/<repository>/<branch-slug>`
+beside the main repository. Existing branches and destination collisions are
+reported without overwriting anything. Launcher prefixes are preserved.
+
+If opening the terminal fails after Git created the worktree, the checkout is
+kept and its path is reported. Return to the picker, refresh, and open it there.
 
 ## Codex launcher prefixes
 
