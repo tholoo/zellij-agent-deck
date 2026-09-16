@@ -7,6 +7,9 @@ is based on Keep a Changelog, and the project follows Semantic Versioning.
 
 ### Added
 
+- OpenCode 2 TUI integration with pane-scoped lifecycle tracking, approvals,
+  questions, tool activity, bounded results, exact session resume, and OpenCode
+  worktree launches. Includes a packaged plugin and optional Home Manager setup.
 - Two-line session rows, explicit statuses, attention groups, repository grouping,
   searchable worktree identity, and scrollable session details.
 - Worktree picker for existing checkouts and agents, with a branch/path/base-commit

@@ -1,5 +1,5 @@
 {
-  description = "Floating cross-session Codex agent navigator for Zellij";
+  description = "Floating cross-session Codex and OpenCode navigator for Zellij";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -67,6 +67,7 @@
               pkgs.git
               pkgs.mypy
               pkgs.nixfmt
+              pkgs.nodejs
               pkgs.openssl
               pkgs.pkg-config
               pkgs.pre-commit
@@ -101,6 +102,16 @@
         in
         {
           package = self.packages.${system}.default;
+
+          opencode =
+            pkgs.runCommand "zellij-agent-deck-opencode-checks"
+              {
+                nativeBuildInputs = [ pkgs.nodejs ];
+              }
+              ''
+                node --test ${source}/tests/test_opencode.mjs
+                touch $out
+              '';
 
           nix-library =
             let

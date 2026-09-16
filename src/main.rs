@@ -12,6 +12,7 @@ struct AgentRecord {
     key: String,
     kind: String,
     codex_session_id: String,
+    opencode_session_id: String,
     parent_key: String,
     zellij_session: String,
     pane_id: Option<u32>,
@@ -97,7 +98,12 @@ fn is_attached(agent: &AgentRecord) -> bool {
 }
 
 fn is_resumable(agent: &AgentRecord) -> bool {
-    !is_attached(agent) && agent.kind == "codex" && !agent.codex_session_id.is_empty()
+    !is_attached(agent)
+        && match agent.kind.as_str() {
+            "codex" => !agent.codex_session_id.is_empty(),
+            "opencode" => !agent.opencode_session_id.is_empty(),
+            _ => false,
+        }
 }
 
 fn detach_requests_for_closed_pane(
@@ -765,7 +771,7 @@ impl AgentDeck {
         });
         self.worktree_prompt.clear();
         self.mode = InputMode::ConfirmWorktree;
-        self.notice = "Start Codex in this worktree? y/n".into();
+        self.notice = "Start an agent in this worktree? y/n".into();
     }
 
     fn confirm_worktree(&mut self) {
@@ -790,7 +796,7 @@ impl AgentDeck {
                 ],
             );
         }
-        self.notice = "Opening Codex in a new pane…".into();
+        self.notice = "Opening agent in a new pane…".into();
     }
 
     fn activate_after_permissions_granted(&mut self) {
@@ -892,7 +898,7 @@ impl AgentDeck {
             InputMode::WorktreePrompt => {
                 self.worktree_prompt = value;
                 self.mode = InputMode::ConfirmWorktree;
-                self.notice = "Create worktree and start Codex? y/n".into();
+                self.notice = "Create worktree and start agent? y/n".into();
             }
             InputMode::WorktreeSearch => {
                 self.worktree_query = value;
@@ -1122,7 +1128,7 @@ impl AgentDeck {
                 },
                 _ => {
                     self.cancel_input();
-                    self.notice = "Codex opened in its worktree".into();
+                    self.notice = "Agent opened in its worktree".into();
                     self.refresh(false, false);
                 }
             }
@@ -1947,6 +1953,24 @@ mod tests {
         assert_eq!(deck.matching_indices(), vec![0]);
         deck.model.set_filter(6);
         assert_eq!(deck.matching_indices(), vec![1]);
+    }
+
+    #[test]
+    fn opencode_records_deserialize_and_are_resumable_after_detaching() {
+        let mut agent: AgentRecord = serde_json::from_str(
+            r#"{"kind":"opencode","opencode_session_id":"ses_example","pane_id":7,"zellij_session":"dev"}"#,
+        ).unwrap();
+        assert!(!is_resumable(&agent));
+        agent.pane_id = None;
+        assert!(is_resumable(&agent));
+        let model = DeckModel {
+            agents: vec![agent.clone()],
+            filter: 6,
+            ..Default::default()
+        };
+        assert!(model.matches_filter(&agent));
+        agent.opencode_session_id.clear();
+        assert!(!is_resumable(&agent));
     }
 
     #[test]

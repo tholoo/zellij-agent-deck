@@ -1,0 +1,7 @@
+{
+  "name": "zellij-agent-deck-opencode",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": { "./tui": "./tui.js" }
+}

@@ -49,6 +49,8 @@ rustPlatform.buildRustPackage {
       $out/share/zellij/plugins/agent-deck.wasm
     install -Dm755 agent_deck.py $out/bin/zellij-agent-deck
     install -Dm755 codex_resurrection.py $out/bin/zellij-agent-deck-codex
+    install -Dm644 opencode/tui.js $out/share/zellij-agent-deck/opencode/tui.js
+    install -Dm644 opencode/package.json $out/share/zellij-agent-deck/opencode/package.json
     install -Dm644 examples/hooks.json $out/share/doc/zellij-agent-deck/examples/hooks.json
     install -Dm644 examples/zellij.kdl $out/share/doc/zellij-agent-deck/examples/zellij.kdl
     install -Dm644 examples/status-layout.kdl $out/share/doc/zellij-agent-deck/examples/status-layout.kdl
@@ -72,12 +74,13 @@ rustPlatform.buildRustPackage {
     PATH=/path-that-does-not-exist $out/bin/zellij-agent-deck --help >/dev/null
     PATH=/path-that-does-not-exist $out/bin/zellij-agent-deck-codex --help >/dev/null
     test -f $out/share/doc/zellij-agent-deck/examples/hooks.json
+    test -f $out/share/zellij-agent-deck/opencode/tui.js
     test -f $out/share/doc/zellij-agent-deck/examples/zellij.kdl
     test -f $out/share/doc/zellij-agent-deck/examples/status-layout.kdl
   '';
 
   meta = {
-    description = "Floating cross-session Codex agent navigator for Zellij";
+    description = "Floating cross-session Codex and OpenCode navigator for Zellij";
     license = lib.licenses.mit;
     mainProgram = "zellij-agent-deck";
     platforms = lib.platforms.linux;

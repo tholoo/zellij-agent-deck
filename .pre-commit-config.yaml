@@ -66,6 +66,13 @@ repos:
         language: system
         types: [nix]
 
+      - id: opencode-tests
+        name: OpenCode plugin tests
+        entry: node --test tests/test_opencode.mjs
+        language: system
+        pass_filenames: false
+        always_run: true
+
       - id: nix-flake-check
         name: nix flake evaluation
         entry: nix flake check path:. --no-build

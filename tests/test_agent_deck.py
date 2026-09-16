@@ -43,6 +43,117 @@ class AgentDeckTest(unittest.TestCase):
         payload = {"hook_event_name": name, "session_id": "abc", "cwd": self.temp.name, **extra}
         return deck.handle_event(payload)
 
+    def opencode_event(self, event="update", **extra):
+        return deck.handle_opencode_event(
+            {
+                "event": event,
+                "session_id": "ses_example",
+                "attachment_id": "a" * 32,
+                "cwd": self.temp.name,
+                **extra,
+            }
+        )
+
+    def test_opencode_lifecycle_preserves_titles_attention_and_ages(self):
+        with patch.object(deck, "now", return_value=100):
+            first = self.opencode_event("attach", title="Fix OpenCode support", status="working")
+        self.assertEqual(first["kind"], "opencode")
+        self.assertEqual(first["opencode_session_id"], "ses_example")
+        self.assertEqual(first["codex_session_id"], "")
+        with patch.object(deck, "now", return_value=110):
+            running = self.opencode_event(status="working", activity="Using bash")
+        self.assertEqual(running["status_since"], 100)
+        self.assertEqual(running["activity_since"], 110)
+        waiting = self.opencode_event(
+            status="needs_input", message="Approval: bash", attention_id="per_example"
+        )
+        self.assertTrue(waiting["unread"])
+        self.assertEqual(waiting["activity"], "")
+        deck.mark_read(waiting["key"], waiting["attention_seq"], waiting["attachment_id"])
+        repeated = self.opencode_event(status="needs_input", attention_id="per_example")
+        self.assertFalse(repeated["unread"])
+        self.assertEqual(repeated["attention_seq"], waiting["attention_seq"])
+        done = self.opencode_event(status="done", attention_id="result-1", message="Done\n" * 100)
+        self.assertTrue(done["unread"])
+        self.assertEqual(len(done["message"]), deck.MESSAGE_LIMIT)
+        self.assertNotIn("\n", done["message"])
+        deck.mutate(done["key"], title="Manual title", title_locked=True)
+        metadata = self.opencode_event(title="Automatic title", model="provider/model")
+        self.assertEqual(metadata["title"], "Manual title")
+        self.assertEqual(metadata["status"], "done")
+        self.assertEqual(metadata["model"], "provider/model")
+        interrupted = self.opencode_event(status="idle", message="Interrupted")
+        self.assertFalse(interrupted["unread"])
+        detached = self.opencode_event("detach")
+        self.assertIsNone(detached["pane_id"])
+        self.assertEqual(detached["opencode_session_id"], "ses_example")
+
+    def test_opencode_stale_events_cannot_overwrite_a_new_attachment(self):
+        self.opencode_event("attach")
+        with patch.dict(os.environ, {"ZELLIJ_PANE_ID": "8"}):
+            latest = self.opencode_event("attach", attachment_id="b" * 32, status="working")
+        for event in ("update", "detach", "delete"):
+            stale = self.opencode_event(event, status="error", attention_id="stale")
+            self.assertEqual(stale["attachment_id"], latest["attachment_id"])
+            self.assertEqual(stale["pane_id"], 8)
+            self.assertEqual(stale["status"], "working")
+            self.assertFalse(stale["dismissed"])
+
+    def test_opencode_ignores_invalid_unattached_and_unknown_events(self):
+        self.assertIsNone(self.opencode_event(status="done"))
+        for extra in ({"session_id": ""}, {"attachment_id": ""}, {"event": "unknown"}):
+            self.assertIsNone(self.opencode_event(**{"event": "attach", **extra}))
+        with patch.dict(os.environ, {"ZELLIJ_SESSION_NAME": ""}):
+            self.assertIsNone(self.opencode_event("attach"))
+        self.assertEqual(deck.records(), [])
+
+    def test_opencode_deletion_removes_resume_and_codex_sessions_are_independent(self):
+        codex = self.event("SessionStart", session_id="ses_example")
+        record = self.opencode_event("attach")
+        self.assertNotEqual(codex["key"], record["key"])
+        deleted = self.opencode_event("delete")
+        self.assertTrue(deleted["dismissed"])
+        self.assertEqual(deleted["opencode_session_id"], "")
+        self.assertEqual([r["key"] for r in deck.records()], [codex["key"]])
+
+    def test_opencode_resume_and_worktree_launch_use_correct_cli(self):
+        with patch.dict(os.environ, {deck.OPENCODE_PREFIX_ENV: '["wrapper", "--quiet"]'}):
+            record = self.opencode_event("attach")
+        self.assertEqual(record["launcher_prefix"], ["wrapper", "--quiet"])
+        with (
+            patch.object(deck.subprocess, "run") as run,
+            patch.object(deck, "zellij_sessions", return_value={"dev": True}),
+        ):
+            deck.do_resume(record)
+        command = run.call_args.args[0]
+        self.assertEqual(
+            command[command.index("--") + 1 :],
+            [
+                "env",
+                'ZELLIJ_AGENT_DECK_OPENCODE_PREFIX=["wrapper","--quiet"]',
+                "wrapper",
+                "--quiet",
+                "opencode",
+                self.temp.name,
+                "--session",
+                "ses_example",
+            ],
+        )
+        with patch.object(deck.subprocess, "run") as run:
+            deck.launch_worktree(
+                record, "/tmp/worktree with spaces", "feature", "a prompt; literal"
+            )
+        command = run.call_args.args[0]
+        self.assertEqual(
+            command[-4:],
+            [
+                "opencode",
+                "/tmp/worktree with spaces",
+                "--prompt",
+                "a prompt; literal",
+            ],
+        )
+
     def test_prompt_sets_safe_location_title_and_working_state(self):
         record = self.event("UserPromptSubmit", prompt="Please implement abc\nwith secrets later")
         self.assertEqual(record["status"], "working")
@@ -603,6 +714,9 @@ class AgentDeckTest(unittest.TestCase):
         self.assertEqual(len(entries), 2)
         self.assertTrue(entries[0]["current"])
         self.assertEqual(entries[0]["agents"], [record["key"]])
+        with patch.dict(os.environ, {"ZELLIJ_PANE_ID": "8"}):
+            opencode = self.opencode_event("attach", cwd=str(other))
+        self.assertEqual(set(deck.worktrees(record)[0]["agents"]), {record["key"], opencode["key"]})
         with self.assertRaisesRegex(SystemExit, "live agent"):
             deck.open_worktree(record, str(other))
         with patch.object(deck, "launch_worktree") as launch:

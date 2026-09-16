@@ -29,6 +29,7 @@ MESSAGE_LIMIT = 180
 CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 SAFE_BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,79}$")
 PREFIX_ENV = "ZELLIJ_AGENT_DECK_CODEX_PREFIX"
+OPENCODE_PREFIX_ENV = "ZELLIJ_AGENT_DECK_OPENCODE_PREFIX"
 PREFIX_ARG_LIMIT = 16
 PREFIX_ARG_LENGTH = 256
 RECONCILE_INTERVAL = 5
@@ -70,6 +71,8 @@ class RecordStore:
         "key",
         "kind",
         "codex_session_id",
+        "opencode_session_id",
+        "opencode_attention_id",
         "parent_key",
         "zellij_session",
         "attachment_id",
@@ -476,14 +479,14 @@ def detect_launcher_prefix(
     return []
 
 
-def launcher_prefix() -> list[str]:
-    configured = os.environ.get(PREFIX_ENV)
+def launcher_prefix(kind: str = "codex") -> list[str]:
+    configured = os.environ.get(OPENCODE_PREFIX_ENV if kind == "opencode" else PREFIX_ENV)
     if configured is not None:
         try:
             return normalize_launcher_prefix(json.loads(configured))
         except (TypeError, ValueError):
             return []
-    return detect_launcher_prefix()
+    return [] if kind == "opencode" else detect_launcher_prefix()
 
 
 def codex_command(record: dict[str, Any], *arguments: str) -> list[str]:
@@ -493,6 +496,24 @@ def codex_command(record: dict[str, Any], *arguments: str) -> list[str]:
         return command
     encoded = json.dumps(prefix, ensure_ascii=False, separators=(",", ":"))
     return ["env", f"{PREFIX_ENV}={encoded}", *command]
+
+
+def agent_command(
+    record: dict[str, Any], cwd: str, *, session_id: str = "", prompt: str = ""
+) -> list[str]:
+    if record.get("kind") != "opencode":
+        arguments = ["resume", "-C", cwd, session_id] if session_id else ["-C", cwd]
+        return codex_command(record, *arguments, *([prompt] if prompt else []))
+    prefix = normalize_launcher_prefix(record.get("launcher_prefix"))
+    command = [*prefix, "opencode", cwd]
+    if session_id:
+        command.extend(["--session", session_id])
+    if prompt:
+        command.extend(["--prompt", prompt])
+    if prefix:
+        encoded = json.dumps(prefix, ensure_ascii=False, separators=(",", ":"))
+        command = ["env", f"{OPENCODE_PREFIX_ENV}={encoded}", *command]
+    return command
 
 
 def base_record(
@@ -510,14 +531,15 @@ def base_record(
         "schema": SCHEMA,
         "key": key,
         "kind": kind,
-        "codex_session_id": clean(payload.get("session_id"), 128),
+        "codex_session_id": "" if kind == "opencode" else clean(payload.get("session_id"), 128),
+        "opencode_session_id": clean(payload.get("session_id"), 128) if kind == "opencode" else "",
         "parent_key": "",
         "zellij_session": zellij_session,
         "pane_id": pane_id,
         "attachment_id": secrets.token_hex(16) if zellij_session and pane_id is not None else "",
-        "launcher_prefix": launcher_prefix(),
+        "launcher_prefix": launcher_prefix(kind),
         **metadata,
-        "title": "Codex session",
+        "title": "OpenCode session" if kind == "opencode" else "Codex session",
         "title_locked": False,
         "status": "idle",
         "unread": False,
@@ -820,6 +842,80 @@ def handle_event(payload: dict[str, Any]) -> dict[str, Any]:
     return record
 
 
+def handle_opencode_event(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Accept bounded TUI snapshots, with an attachment token fencing stale clients."""
+    event = payload.get("event")
+    session_id = clean(payload.get("session_id"), 128)
+    attachment = clean(payload.get("attachment_id"), 64)
+    session = clean(os.environ.get("ZELLIJ_SESSION_NAME"), 128)
+    pane = pane_number(os.environ.get("ZELLIJ_PANE_ID"))
+    if (
+        event not in {"attach", "update", "detach", "delete"}
+        or not re.fullmatch(r"ses[\w-]+", session_id)
+        or not re.fullmatch(r"[a-f0-9]{32}", attachment)
+        or not session
+        or pane is None
+    ):
+        return None
+    key = f"opencode:{session_id}"
+    existing = RECORDS.get(key)
+    if event != "attach" and existing is None:
+        return None
+    cwd = clean(payload.get("cwd") or (existing or {}).get("cwd") or os.getcwd(), 512)
+    refresh = event == "attach" or cwd != (existing or {}).get("cwd")
+    metadata = project_metadata(cwd, timeout=HOOK_GIT_TIMEOUT) if refresh else None
+    initial = base_record(payload, key, "opencode", metadata) if existing is None else None
+
+    def transition(record: dict[str, Any]) -> dict[str, Any]:
+        if event != "attach" and (
+            record.get("attachment_id") != attachment
+            or record.get("zellij_session") != session
+            or record.get("pane_id") != pane
+        ):
+            return record
+        if event in {"detach", "delete"}:
+            record.update(pane_id=None, attachment_id="", status="ended", unread=False, activity="")
+            if event == "delete":
+                record.update(opencode_session_id="", dismissed=True)
+        else:
+            if event == "attach":
+                record.update(
+                    zellij_session=session,
+                    pane_id=pane,
+                    attachment_id=attachment,
+                    launcher_prefix=launcher_prefix("opencode"),
+                    dismissed=False,
+                )
+            if metadata is not None:
+                record.update(metadata)
+            title = clean(payload.get("title"), TITLE_LIMIT)
+            if title and not record.get("title_locked"):
+                record["title"] = title
+            if "model" in payload:
+                record["model"] = clean(payload["model"], 64)
+            status = payload.get("status")
+            if status in {"idle", "working", "needs_input", "done", "error"}:
+                record["status"] = status
+                record["activity"] = (
+                    clean(payload.get("activity"), MESSAGE_LIMIT) if status == "working" else ""
+                )
+                record["message"] = clean(payload.get("message"), MESSAGE_LIMIT)
+                attention_id = clean(payload.get("attention_id"), 128)
+                if status in {"needs_input", "done", "error"}:
+                    if attention_id and attention_id != record.get("opencode_attention_id"):
+                        record["attention_seq"] = record.get("attention_seq", 0) + 1
+                        record["unread"] = True
+                        record["opencode_attention_id"] = attention_id
+                else:
+                    record["unread"] = False
+        record["updated_at"] = now()
+        return record
+
+    record = RECORDS.update(key, transition, initial)
+    pipe_event(record)
+    return record
+
+
 def detach_record(record: dict[str, Any]) -> dict[str, Any]:
     def transition(current: dict[str, Any]) -> dict[str, Any]:
         current["pane_id"] = None
@@ -1029,9 +1125,11 @@ def do_park(record: dict[str, Any]) -> None:
 
 
 def do_resume(record: dict[str, Any], fallback_session: str = "") -> None:
-    session_id = record.get("codex_session_id")
+    session_id = record.get(
+        "opencode_session_id" if record.get("kind") == "opencode" else "codex_session_id"
+    )
     if not session_id:
-        raise SystemExit("agent has no resumable Codex session id")
+        raise SystemExit("agent has no resumable session id")
     recorded_session = clean(record.get("zellij_session"), 128)
     fallback_session = clean(fallback_session or os.environ.get("ZELLIJ_SESSION_NAME"), 128)
     session = recorded_session or fallback_session
@@ -1052,7 +1150,7 @@ def do_resume(record: dict[str, Any], fallback_session: str = "") -> None:
         "--name",
         title,
         "--",
-        *codex_command(record, "resume", "-C", record["cwd"], session_id),
+        *agent_command(record, record["cwd"], session_id=session_id),
     ]
     subprocess.run(command, check=True)
     mutate(
@@ -1131,7 +1229,7 @@ def worktrees(record: dict[str, Any]) -> list[dict[str, Any]]:
             if agent.get("project_root") == item["path"]
             and agent.get("pane_id") is not None
             and agent.get("zellij_session")
-            and agent.get("kind") == "codex"
+            and agent.get("kind") in {"codex", "opencode"}
         ]
     return sorted(items, key=lambda item: (not item["current"], item["branch"], item["path"]))
 
@@ -1149,17 +1247,15 @@ def launch_worktree(record: dict[str, Any], path: str, branch: str, prompt: str 
         "--cwd",
         path,
         "--name",
-        f"{record.get('project', 'Codex')}: {branch}",
+        f"{record.get('project', 'Agent')}: {branch}",
         "--",
-        *codex_command(record, "-C", path),
+        *agent_command(record, path, prompt=prompt),
     ]
-    if prompt:
-        command.append(prompt)
     try:
         subprocess.run(command, check=True)
     except (OSError, subprocess.CalledProcessError) as error:
         raise SystemExit(
-            f"Checkout remains at {path}; could not open a Codex pane: {error}"
+            f"Checkout remains at {path}; could not open an agent pane: {error}"
         ) from None
 
 
@@ -1249,6 +1345,7 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(prog="zellij-agent-deck")
     sub = result.add_subparsers(dest="command", required=True)
     sub.add_parser("hook")
+    sub.add_parser("opencode-hook")
     listing = sub.add_parser("list")
     listing.add_argument("--refresh", action="store_true")
     listing.add_argument("--reconcile", action="store_true")
@@ -1288,12 +1385,17 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = parser().parse_args()
-    if args.command == "hook":
+    if args.command in {"hook", "opencode-hook"}:
         try:
             payload = json.load(sys.stdin)
         except (ValueError, TypeError):
             raise SystemExit("invalid hook JSON") from None
-        handle_event(payload)
+        if not isinstance(payload, dict):
+            raise SystemExit("invalid hook JSON")
+        if args.command == "opencode-hook":
+            handle_opencode_event(payload)
+        else:
+            handle_event(payload)
     elif args.command == "list":
         if args.reconcile:
             reconcile_records()

@@ -163,6 +163,14 @@ fn details(agent: &AgentRecord, now: u64) -> Vec<String> {
         format!("{} · {}", status(agent), age(now, agent.status_since)),
         branch_label(agent),
         format!("Worktree  {}", agent.project_root),
+        format!(
+            "Agent  {}",
+            if agent.kind == "opencode" {
+                "OpenCode"
+            } else {
+                "Codex"
+            }
+        ),
     ];
     if !agent.message.is_empty() {
         lines.insert(2, agent.message.clone());
@@ -354,11 +362,20 @@ fn worktree_screen(deck: &AgentDeck, rows: usize, cols: usize) -> Screen {
         return screen;
     }
     let mut lines = Vec::new();
+    let agent_name = if deck
+        .action_target
+        .as_ref()
+        .is_some_and(|agent| agent.kind == "opencode")
+    {
+        "OpenCode"
+    } else {
+        "Codex"
+    };
     if let Some(plan) = &deck.worktree_plan {
         lines.push(if plan.existing {
-            "Start a new Codex session".into()
+            format!("Start a new {agent_name} session")
         } else {
-            "Create a new worktree and Codex session".into()
+            format!("Create a new worktree and {agent_name} session")
         });
         lines.push(format!("Branch       {}", plan.branch));
         if !plan.existing {
@@ -373,7 +390,7 @@ fn worktree_screen(deck: &AgentDeck, rows: usize, cols: usize) -> Screen {
             lines.push(format!(
                 "First prompt {}",
                 if deck.worktree_prompt.is_empty() {
-                    "None — open Codex ready for input"
+                    "None — ready for input"
                 } else {
                     &deck.worktree_prompt
                 }

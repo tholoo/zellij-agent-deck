@@ -1,16 +1,16 @@
 # Zellij Agent Deck
 
-A floating, cross-session inbox and control surface for Codex agents. Codex
-lifecycle hooks send bounded status records to a background Zellij plugin. The
-plugin highlights panes that need attention and opens as a floating pane on
-demand.
+A floating, cross-session inbox and control surface for Codex and OpenCode agents.
+Codex lifecycle hooks and an OpenCode TUI plugin send bounded status records to a
+background Zellij plugin. The plugin highlights panes that need attention and
+opens as a floating pane on demand.
 
 The project is currently pre-release; use the pinned `main` branch until the
 first versioned release is tagged.
 
 > [!IMPORTANT]
-> This project is an independent integration for Codex and Zellij. It is not
-> affiliated with or endorsed by OpenAI or the Zellij project.
+> This project is an independent integration for Codex, OpenCode, and Zellij.
+> It is not affiliated with or endorsed by their developers.
 
 ![Zellij Agent Deck running with synthetic agent sessions](docs/assets/agent-deck-current.png)
 
@@ -20,7 +20,7 @@ _Actual plugin UI with fictional sessions and task data._
 
 - Linux
 - Zellij 0.45.0
-- Codex with lifecycle hooks enabled
+- Codex with lifecycle hooks enabled, or OpenCode 2.0 with the TUI plugin below
 - Nix with flakes enabled (recommended build and installation path)
 
 The host bridge optionally uses `git`, `gh`, and `ss` to enrich agent records.
@@ -52,6 +52,7 @@ sets resurrection retention options:
 {
   imports = [ inputs.zellij-agent-deck.homeManagerModules.default ];
   programs.zellij-agent-deck.enable = true;
+  programs.zellij-agent-deck.opencode.enable = true; # Optional OpenCode 2 integration
 }
 ```
 
@@ -105,14 +106,56 @@ hook process's `PATH`.
 Codex requires non-managed hooks to be reviewed before they run. Open `/hooks`
 in Codex after adding or changing the file, inspect the command, and trust it.
 
+## Configure OpenCode
+
+For OpenCode **2.0**, copy the bundled plugin directory into your OpenCode config:
+
+```console
+mkdir -p ~/.config/opencode/plugins/zellij-agent-deck
+cp ~/.nix-profile/share/zellij-agent-deck/opencode/{package.json,tui.js} \
+  ~/.config/opencode/plugins/zellij-agent-deck/
+```
+
+For a checkout, copy the files from [`opencode/`](opencode/) instead. Use
+`$XDG_CONFIG_HOME/opencode` if your config directory is customized. Home Manager's
+`programs.zellij-agent-deck.opencode.enable` installs the directory declaratively.
+Restart OpenCode after installation. The TUI must have `zellij-agent-deck` on its
+`PATH`; alternatively set `ZELLIJ_AGENT_DECK_COMMAND` to the bridge executable's
+absolute path.
+
+The integration uses OpenCode's [local TUI plugin API](https://opencode.ai/v2/docs/build/plugins/cli).
+It tracks the session currently displayed in each Zellij pane, including its
+title, model, working/completed/interrupted states, approvals, questions, tool
+names, and a bounded result excerpt. Shared-server events for other sessions are
+ignored. Switching OpenCode sessions detaches the previous record; it remains
+available under `7:resume`. Background OpenCode tabs and headless/mini clients
+are not tracked. Use separate Zellij panes for sessions you want to monitor
+simultaneously. This plugin does not support the OpenCode 1.x plugin API.
+
+`R` opens the exact session with `opencode <directory> --session <id>`.
+Worktree launches use the selected agent's application, so an OpenCode selection
+starts OpenCode. The details panel identifies the application. Replies and
+parking use the same Zellij pane controls as Codex; answer approval/form dialogs
+inside OpenCode. Exact Zellij command resurrection remains Codex-specific.
+
+For a launcher wrapper, explicitly record its prefix:
+
+```console
+ZELLIJ_AGENT_DECK_OPENCODE_PREFIX='["command-wrapper","--quiet"]' \
+  command-wrapper --quiet opencode
+```
+
+OpenCode resumes and worktree launches preserve this prefix. OpenCode wrapper
+prefixes are not inferred from process ancestry.
+
 ## Privacy and local state
 
 The deck never writes complete prompts or transcripts. To make the inbox
 useful, it does store bounded excerpts: the Codex-generated thread name (or a
-normalized first-prompt fallback while no name is available) up to 72
-characters, status details (up to 180 characters), paths, Zellij/Codex
-identifiers, launcher commands, and Git metadata. Do not put secrets at the
-start of prompts or in commands passed to approval dialogs.
+normalized first-prompt fallback while no name is available), or the OpenCode
+session title, up to 72 characters, status details (up to 180 characters), paths,
+Zellij/agent identifiers, launcher commands, and Git metadata. Do not put secrets
+at the start of prompts or in commands passed to approval dialogs.
 
 Records are written with owner-only permissions to
 `${XDG_RUNTIME_DIR:-/tmp}/zellij-agent-deck-$UID` and expire after 14 days.
@@ -152,7 +195,7 @@ panes and dead Zellij sessions when no Codex shutdown hook can run.
 - `r`: compose and confirm a reply
 - `t`: override the `project: task` title
 - `w`: browse the selected repository's worktrees; `n` in the picker creates one
-- `p`: confirm parking with Ctrl-C; `R`: resume the Codex session
+- `p`: confirm parking with Ctrl-C; `R`: resume the selected Codex or OpenCode session
 - `m`: mark read; `d`: dismiss
 - `g`: refresh branch, dirty state, GitHub PR, and listening ports
 - `s`: show or hide subagents for the current plugin instance
@@ -169,8 +212,8 @@ paths, session names, tasks, activity, and result excerpts.
 Press `w` on a session to list its repository's registered Git worktrees. The
 picker shows the current checkout and live agent counts. `Enter` opens the
 existing agent, or shows the agents in that checkout when there are several.
-If none are running, it offers to start Codex there. `/` searches the picker,
-`g` refreshes, and `Esc` returns.
+If none are running, it offers to start the selected agent's application there.
+`/` searches the picker, `g` refreshes, and `Esc` returns.
 
 To create a checkout, press `n` in the picker and enter a new branch name. Review
 the destination and base commit, optionally enter an initial prompt, then confirm

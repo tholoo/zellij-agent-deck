@@ -26,6 +26,8 @@ in
       description = "Install the WASM plugin under the Zellij configuration directory.";
     };
 
+    opencode.enable = lib.mkEnableOption "OpenCode 2 TUI integration";
+
     resurrection = {
       retentionDays = lib.mkOption {
         type = lib.types.ints.unsigned;
@@ -52,6 +54,10 @@ in
 
     xdg.configFile."zellij/plugins/agent-deck.wasm" = lib.mkIf cfg.installPlugin {
       source = "${cfg.package}/share/zellij/plugins/agent-deck.wasm";
+    };
+
+    xdg.configFile."opencode/plugins/zellij-agent-deck" = lib.mkIf cfg.opencode.enable {
+      source = "${cfg.package}/share/zellij-agent-deck/opencode";
     };
 
     home.sessionVariables = {
