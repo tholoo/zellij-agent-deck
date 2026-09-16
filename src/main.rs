@@ -316,6 +316,7 @@ struct AgentDeck {
     applied_list_request: u64,
     focus_request: Option<Vec<AgentRecord>>,
     acknowledged: BTreeMap<String, (String, u64)>,
+    read_save_failures: BTreeMap<String, String>,
     action_target: Option<AgentRecord>,
     screen_hits: BTreeMap<usize, ui::Hit>,
     compact_status: bool,
@@ -331,7 +332,6 @@ struct AgentDeck {
     detail_scroll: usize,
     plugin_id: Option<u32>,
     manual_size: bool,
-    sized_for_open: bool,
 }
 
 impl AgentDeck {
@@ -811,19 +811,49 @@ impl AgentDeck {
         }
     }
 
-    fn size_deck(&self) {
-        if self.permissions_granted && !self.compact_status && !self.manual_size {
-            if let Some(plugin_id) = self.plugin_id {
-                change_floating_panes_coordinates(vec![(
-                    PaneId::Plugin(plugin_id),
-                    FloatingPaneCoordinates::default()
-                        .with_x_percent(4)
-                        .with_y_percent(5)
-                        .with_width_percent(92)
-                        .with_height_percent(90),
-                )]);
+    fn read_save_notice(&self) -> String {
+        self.read_save_failures.values().next().map_or_else(String::new, |detail| {
+            if detail.contains("unrecognized arguments")
+                && (detail.contains("--attention-seq") || detail.contains("--attachment-id"))
+            {
+                "Could not save read state: outdated helper. Refresh Zellij config and reload Deck.".into()
+            } else {
+                truncate(&format!("Could not save read state; will retry: {detail}"), 180)
             }
+        })
+    }
+
+    fn open_deck(&self) {
+        if !self.permissions_granted || self.compact_status {
+            return;
         }
+        let Some(plugin_id) = self.plugin_id else {
+            return;
+        };
+        let Ok((target_tab, _)) = get_focused_pane_info() else {
+            return;
+        };
+        // Prepare the floating pane without focusing it. LaunchOrFocusPlugin
+        // resets geometry when moving tabs; BreakPanes preserves it instead.
+        let pane_id = PaneId::Plugin(plugin_id);
+        let coordinates = if self.manual_size {
+            get_pane_info(pane_id).map_or_else(FloatingPaneCoordinates::default, |pane| {
+                FloatingPaneCoordinates::default()
+                    .with_x_fixed(pane.pane_x)
+                    .with_y_fixed(pane.pane_y)
+                    .with_width_fixed(pane.pane_columns)
+                    .with_height_fixed(pane.pane_rows)
+            })
+        } else {
+            FloatingPaneCoordinates::default()
+                .with_x_percent(4)
+                .with_y_percent(5)
+                .with_width_percent(92)
+                .with_height_percent(90)
+        };
+        change_floating_panes_coordinates(vec![(pane_id, coordinates)]);
+        break_panes_to_tab_with_index(&[pane_id], target_tab, false);
+        show_self(true);
     }
 
     fn submit_input(&mut self) {
@@ -1099,11 +1129,28 @@ impl AgentDeck {
             return;
         }
         if operation == "auto-read" {
-            if code.unwrap_or(1) != 0 {
-                if let Some(key) = context.get("key") {
+            let previous_notice = self.read_save_notice();
+            let failed = code.unwrap_or(1) != 0;
+            if let Some(key) = context.get("key") {
+                if failed {
                     self.acknowledged.remove(key);
+                    let stderr = String::from_utf8_lossy(&stderr);
+                    let detail = stderr.lines().rev().find(|line| !line.trim().is_empty());
+                    self.read_save_failures.insert(
+                        key.clone(),
+                        detail
+                            .unwrap_or("helper returned no error details")
+                            .trim()
+                            .into(),
+                    );
+                } else {
+                    self.read_save_failures.remove(key);
                 }
-                self.notice = "Could not save read state; will retry".into();
+            }
+            // A recovered save must not leave a stale warning behind, or erase
+            // a newer notice from a user action. Other failed saves still matter.
+            if failed || self.notice == previous_notice {
+                self.notice = self.read_save_notice();
             }
             self.refresh(false, false);
             return;
@@ -1226,13 +1273,7 @@ impl ZellijPlugin for AgentDeck {
             Event::Visible(visible) => {
                 self.visible = visible;
                 if visible {
-                    self.size_deck();
                     self.refresh(false, true);
-                }
-            }
-            Event::Timer(seconds) if seconds < 1.0 => {
-                if self.sized_for_open {
-                    self.size_deck();
                 }
             }
             Event::Timer(_) => {
@@ -1241,24 +1282,7 @@ impl ZellijPlugin for AgentDeck {
                 set_timeout(3.0);
                 self.request_focus();
             }
-            Event::PaneUpdate(manifest) => {
-                if let Some(pane) = manifest
-                    .panes
-                    .values()
-                    .flatten()
-                    .find(|pane| pane.is_plugin && Some(pane.id) == self.plugin_id)
-                {
-                    if pane.is_suppressed || !pane.is_focused {
-                        self.sized_for_open = false;
-                    } else if !self.sized_for_open && !self.compact_status {
-                        self.sized_for_open = true;
-                        // LaunchOrFocusPlugin can apply its default geometry after
-                        // Visible(true); resize after that action has completed.
-                        if self.permissions_granted {
-                            set_timeout(0.1);
-                        }
-                    }
-                }
+            Event::PaneUpdate(_) => {
                 self.request_focus();
             }
             Event::TabUpdate(_) | Event::SessionUpdate(_, _) => {
@@ -1296,11 +1320,8 @@ impl ZellijPlugin for AgentDeck {
                     return true;
                 }
             }
-        } else if pipe_message.name == "toggle" {
-            if !self.compact_status {
-                show_self(true);
-                self.size_deck();
-            }
+        } else if matches!(pipe_message.name.as_str(), "open" | "toggle") {
+            self.open_deck();
         } else if pipe_message.name == "attention-next" && !self.compact_status {
             self.pending_attention = true;
             self.refresh(false, false);
@@ -1535,6 +1556,55 @@ mod tests {
             AgentDeck::context("list"),
         );
         assert!(!deck.model.agents[0].unread);
+    }
+
+    #[test]
+    fn recovered_read_save_clears_its_warning() {
+        let mut deck = AgentDeck::default();
+        let mut context = AgentDeck::context("auto-read");
+        context.insert("key".into(), "codex:fixture".into());
+        deck.handle_result(
+            Some(1),
+            vec![],
+            b"temporary failure".to_vec(),
+            context.clone(),
+        );
+        assert!(deck.notice.contains("Could not save read state"));
+        deck.handle_result(Some(0), vec![], vec![], context);
+        assert!(
+            deck.notice.is_empty(),
+            "a successful retry must clear the save warning"
+        );
+    }
+
+    #[test]
+    fn one_successful_read_does_not_hide_another_failed_save() {
+        let mut deck = AgentDeck::default();
+        let mut a = AgentDeck::context("auto-read");
+        a.insert("key".into(), "a".into());
+        let mut b = a.clone();
+        b.insert("key".into(), "b".into());
+        deck.handle_result(Some(1), vec![], b"save A failed".to_vec(), a.clone());
+        deck.handle_result(Some(1), vec![], b"save B failed".to_vec(), b.clone());
+        deck.handle_result(Some(0), vec![], vec![], a);
+        assert!(deck.notice.contains("save B failed"));
+        deck.notice = "Reply sent".into();
+        deck.handle_result(Some(0), vec![], vec![], b);
+        assert_eq!(deck.notice, "Reply sent");
+    }
+
+    #[test]
+    fn old_helper_errors_explain_how_to_recover() {
+        let mut deck = AgentDeck::default();
+        let mut context = AgentDeck::context("auto-read");
+        context.insert("key".into(), "a".into());
+        deck.handle_result(
+            Some(2), vec![],
+            b"usage: zellij-agent-deck\nerror: unrecognized arguments: --attention-seq 1 --attachment-id example".to_vec(),
+            context,
+        );
+        assert!(deck.notice.contains("outdated helper"));
+        assert!(deck.notice.contains("reload Deck"));
     }
 
     #[test]

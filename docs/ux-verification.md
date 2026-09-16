@@ -13,12 +13,26 @@ nix develop --command pre-commit run --all-files
 nix flake check path:.
 ```
 
+To exercise the actual plugin in disposable Zellij sessions:
+
+```console
+nix develop --command cargo build --release --target wasm32-wasip1
+ZELLIJ_AGENT_DECK_TEST_WASM=target/wasm32-wasip1/release/zellij-agent-deck.wasm \
+  python3 -m unittest discover -s tests -p test_zellij_runtime.py -v
+```
+
+This checks the shipped Alt+a binding, first-visible pane dimensions, reopening,
+moving between tabs, preserving another floating pane, and clearing a save warning
+after a successful retry. It uses synthetic records and never starts Codex.
+
 Regression coverage includes:
 
 - Manual focus acknowledges a result without resolving its pending request.
 - Inactive tabs, other sessions, and detached clients do not count as seen.
 - Old acknowledgements cannot clear new results or a new pane attachment.
 - Stale signals and list snapshots cannot restore acknowledged unread state.
+- Successful save retries clear their warning without hiding another failed save.
+- Incompatible helper errors explain how to refresh the configuration and plugin.
 - Selection and reply targets survive asynchronous sorting and refreshes.
 - Seen requests remain actionable; next-attention navigation cycles across filters.
 - Status/activity ages survive metadata refreshes and acknowledgements.
@@ -53,8 +67,9 @@ arguments and makes no model requests:
    the recorded stub launcher opens there with no initial prompt.
 5. Load the optional status layout. The summary remains visible in a single
    unselectable row while the floating deck is closed.
-6. Close and reopen the deck. It expands to the configured terminal-relative
-   size. Check the narrow list and wide details panel, search, and worktree forms.
+6. Close and reopen the deck. Its first visible frame is already at its final
+   size, including when moving to another tab or opening beside another float.
+   Check the narrow list and wide details panel, search, and worktree forms.
 
 The README screenshot is captured from the actual plugin using fictional data.
 Desktop window focus is outside the read-state contract: an attached client's

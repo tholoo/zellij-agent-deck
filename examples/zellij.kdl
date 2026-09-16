@@ -14,9 +14,8 @@ load_plugins {
 keybinds {
     shared_except "locked" {
         bind "Alt a" {
-            LaunchOrFocusPlugin "agent-deck" {
-                floating true
-                move_to_focused_tab true
+            MessagePlugin "agent-deck" {
+                name "open"
             }
             SwitchToMode "Normal"
         }
