@@ -35,6 +35,8 @@ is based on Keep a Changelog, and the project follows Semantic Versioning.
 
 ### Fixed
 
+- Return interrupted Codex turns to idle and clear stale activity and attention
+  through the `Interrupt` lifecycle hook.
 - Preserve selected sessions and action targets when incoming updates reorder rows.
 - Show reply content and its worktree target before confirmation, and filter a
   worktree's agents by its exact checkout path.

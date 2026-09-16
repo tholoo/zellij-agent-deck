@@ -137,6 +137,9 @@ Codex to generate progress descriptions. Status and activity ages are independen
 of metadata refreshes and read acknowledgements.
 Blocking questions from `request_user_input` appear as **Needs you**. Completed
 tools are labeled **Finished …** while the agent continues its turn.
+Interrupting a turn with `Esc` returns the session to **Idle** with an
+**Interrupted** detail and clears pending attention. Existing hook installations
+must include the `Interrupt` handler from `examples/hooks.json` for this update.
 
 The plugin listens for Zellij pane-close events and periodically reconciles its
 records with Zellij 0.45's structured pane list. This also catches force-closed

@@ -779,6 +779,10 @@ def handle_event(payload: dict[str, Any]) -> dict[str, Any]:
         elif event in {"Stop", "SubagentStop"}:
             record["status"] = "done"
             record["unread"] = True
+        elif event == "Interrupt":
+            record["status"] = "idle"
+            record["unread"] = False
+            record["message"] = "Interrupted"
         elif event == "SessionEnd":
             record["status"] = "ended"
             record["unread"] = False

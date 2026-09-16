@@ -94,6 +94,17 @@
         ]
       }
     ],
+    "Interrupt": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "zellij-agent-deck hook",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [

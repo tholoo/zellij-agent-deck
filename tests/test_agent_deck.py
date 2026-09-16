@@ -59,6 +59,50 @@ class AgentDeckTest(unittest.TestCase):
         done = self.event("Stop", last_assistant_message="Implemented it")
         self.assertEqual((done["status"], done["message"]), ("done", "Implemented it"))
 
+    def test_interrupt_clears_working_state_and_preserves_attachment(self):
+        self.event("UserPromptSubmit", prompt="fix tests")
+        running = self.event(
+            "PreToolUse", tool_name="exec_command", tool_input={"cmd": "cargo test"}
+        )
+
+        interrupted = self.event("Interrupt", turn_id="turn-1")
+
+        self.assertEqual(interrupted["status"], "idle")
+        self.assertEqual(interrupted["message"], "Interrupted")
+        self.assertEqual(interrupted["activity"], "")
+        self.assertFalse(interrupted["unread"])
+        self.assertEqual(interrupted["pane_id"], running["pane_id"])
+        self.assertEqual(interrupted["attachment_id"], running["attachment_id"])
+        self.assertEqual(deck.lookup(running["key"]), interrupted)
+
+        resumed = self.event("UserPromptSubmit", prompt="continue")
+        self.assertEqual(resumed["status"], "working")
+        self.assertEqual(resumed["message"], "")
+
+    def test_interrupt_clears_pending_approval(self):
+        waiting = self.event(
+            "PermissionRequest", tool_name="exec_command", tool_input={"cmd": "cargo test"}
+        )
+
+        interrupted = self.event("Interrupt")
+
+        self.assertEqual(interrupted["status"], "idle")
+        self.assertEqual(interrupted["message"], "Interrupted")
+        self.assertFalse(interrupted["unread"])
+        self.assertEqual(interrupted["attention_seq"], waiting["attention_seq"])
+
+    def test_example_registers_interrupt_with_supported_timeout(self):
+        config = json.loads((MODULE_PATH.parent / "examples" / "hooks.json").read_text())
+        hooks = [hook for group in config["hooks"]["Interrupt"] for hook in group["hooks"]]
+        self.assertTrue(
+            any(
+                hook["type"] == "command"
+                and hook["command"] == "zellij-agent-deck hook"
+                and 1 <= hook["timeout"] <= 3
+                for hook in hooks
+            )
+        )
+
     def test_questions_and_finished_tools_are_described_from_existing_hooks(self):
         waiting = self.event(
             "PreToolUse",
