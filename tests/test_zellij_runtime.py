@@ -158,6 +158,31 @@ class ZellijRuntimeTest(unittest.TestCase):
                 self.assertEqual(self.floating_terminals(), before)
                 self.close_deck()
                 self.assertEqual(self.floating_terminals(), before)
+                # Closed/reordered tabs no longer have IDs equal to positions.
+                # Keep the deck on the second tab, as in a long-lived session.
+                self.cli("action", "go-to-tab", "2")
+                self.open_and_check(1)
+                self.close_deck()
+                self.cli("action", "close-tab-by-id", "0")
+                self.cli("action", "new-tab")
+                self.cli("action", "move-tab", "left")
+                self.open_and_check(2, native_move=True)
+                self.close_deck()
+                self.open_and_check(2)
+                self.close_deck()
+                self.cli("action", "new-tab")
+                self.cli("run", "--floating", "--", shutil.which("sleep"), "600")
+                before = self.floating_terminals()
+                self.open_and_check(3, native_move=True)
+                self.assertEqual(self.floating_terminals(), before)
+                self.close_deck()
+                self.assertEqual(self.floating_terminals(), before)
+                self.cli("action", "go-to-tab", "1")
+                self.open_and_check(2, native_move=True)
+                self.close_deck()
+                self.cli("action", "go-to-tab", "2")
+                self.open_and_check(1)
+                self.close_deck()
             finally:
                 self.cli("kill-session", self.session, check=False)
                 if client.poll() is None:
@@ -194,7 +219,7 @@ class ZellijRuntimeTest(unittest.TestCase):
     def panes(self):
         return json.loads(self.cli("action", "list-panes", "--all", "--json").stdout)
 
-    def open_and_check(self, tab_id):
+    def open_and_check(self, tab_id, native_move=False):
         self.screen.clear()
         os.write(self.master, b"\x1ba")
         seen = []
@@ -207,8 +232,22 @@ class ZellijRuntimeTest(unittest.TestCase):
                 seen.append((pane["pane_columns"], pane["pane_rows"], pane["tab_id"]))
             time.sleep(0.01)
         self.assertTrue(seen, "Deck did not open")
-        self.assertEqual(set(seen), {(128, 36, tab_id)}, "Deck changed size after opening")
+        self.assertEqual(
+            {tab for _, _, tab in seen}, {tab_id}, "Deck switched away from the invoking tab"
+        )
+        if native_move:
+            # Zellij's safe native mover resets geometry; the completion
+            # callback must restore it. Ordinary opens must be sized first.
+            self.assertEqual(seen[-1][:2], (128, 36), "Deck did not restore its size")
+        else:
+            self.assertEqual(
+                {(columns, rows) for columns, rows, _ in seen},
+                {(128, 36)},
+                "Deck changed size after opening",
+            )
         self.assertIn(b"Agent Deck", self.screen)
+        tabs = json.loads(self.cli("action", "list-tabs", "--json").stdout)
+        self.assertEqual({tab["tab_id"] for tab in tabs if tab["active"]}, {tab_id})
 
     def close_deck(self):
         os.write(self.master, b"q")

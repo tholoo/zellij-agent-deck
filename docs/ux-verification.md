@@ -22,8 +22,11 @@ ZELLIJ_AGENT_DECK_TEST_WASM=target/wasm32-wasip1/release/zellij-agent-deck.wasm 
 ```
 
 This checks the shipped Alt+a binding, first-visible pane dimensions, reopening,
-moving between tabs, preserving another floating pane, and clearing a save warning
-after a successful retry. It uses synthetic records and never starts Codex.
+moving between tabs (including closed/reordered tab histories), preserving another
+floating pane, and clearing a save warning after a successful retry. It uses
+synthetic records and never starts Codex.
+On Zellij 0.45, moves after tab churn use the native plugin mover and check the
+restored dimensions; ordinary opens also check the first visible dimensions.
 
 Regression coverage includes:
 

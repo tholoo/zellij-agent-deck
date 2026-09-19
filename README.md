@@ -69,8 +69,12 @@ your Nix profile. The configuration loads one hidden plugin instance in each
 session and binds `Alt a` to show or focus the floating deck.
 
 The `MessagePlugin` binding opens the deck at 92% of the terminal width and 90%
-of its height, with its size set before it becomes visible. Replace an older
+of its height. Replace an older
 `LaunchOrFocusPlugin` binding with the example above to use this opening behavior.
+The deck normally sets its size before becoming visible. For closed or reordered
+tabs, it uses Zellij's native plugin mover to avoid a Zellij 0.45 tab-ID bug, then
+restores its size immediately; a default-size frame can appear during this move.
+This fallback requires Zellij's `RunActionsAsUser` plugin permission.
 Set `auto_size "false"` to keep manually chosen floating-pane dimensions. The
 example also binds `Alt n` to jump directly to the next session needing attention,
 including across Zellij sessions. Existing configurations can keep their current

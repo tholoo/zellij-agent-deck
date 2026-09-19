@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use unicode_width::UnicodeWidthStr;
 use zellij_tile::prelude::*;
+use zellij_utils::input::layout::RunPluginOrAlias;
 
 mod ui;
 
@@ -339,19 +340,23 @@ struct AgentDeck {
     detail_scroll: usize,
     plugin_id: Option<u32>,
     manual_size: bool,
+    plugin_configuration: BTreeMap<String, String>,
+    plugin_tab_position: Option<usize>,
+    pending_open: Option<FloatingPaneCoordinates>,
 }
 
 impl AgentDeck {
-    fn required_permissions() -> [PermissionType; 4] {
+    fn required_permissions() -> [PermissionType; 5] {
         [
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
             PermissionType::RunCommands,
             PermissionType::ReadSessionEnvironmentVariables,
+            PermissionType::RunActionsAsUser,
         ]
     }
 
-    fn subscribed_events() -> [EventType; 11] {
+    fn subscribed_events() -> [EventType; 12] {
         [
             EventType::Key,
             EventType::Mouse,
@@ -364,6 +369,7 @@ impl AgentDeck {
             EventType::TabUpdate,
             EventType::SessionUpdate,
             EventType::ListClients,
+            EventType::ActionComplete,
         ]
     }
 
@@ -832,14 +838,17 @@ impl AgentDeck {
         })
     }
 
-    fn open_deck(&self) {
-        if !self.permissions_granted || self.compact_status {
+    fn open_deck(&mut self) {
+        if !self.permissions_granted || self.compact_status || self.pending_open.is_some() {
             return;
         }
         let Some(plugin_id) = self.plugin_id else {
             return;
         };
-        let Ok((target_tab, _)) = get_focused_pane_info() else {
+        let Ok((target_tab_id, _)) = get_focused_pane_info() else {
+            return;
+        };
+        let Some(target_tab) = get_tab_info(target_tab_id) else {
             return;
         };
         // Prepare the floating pane without focusing it. LaunchOrFocusPlugin
@@ -860,8 +869,43 @@ impl AgentDeck {
                 .with_width_percent(92)
                 .with_height_percent(90)
         };
+        if target_tab_id != target_tab.position
+            && self.plugin_tab_position != Some(target_tab.position)
+        {
+            // Zellij 0.45's BreakPanes APIs mix IDs and positions internally:
+            // either argument can fail or even drop a pane after tab churn.
+            // Its native plugin mover handles this case safely, but resets
+            // geometry, so restore the requested size when the move completes.
+            let Some(url) = get_pane_info(pane_id).and_then(|pane| pane.plugin_url) else {
+                return;
+            };
+            let Ok(plugin) = RunPluginOrAlias::from_url(
+                &url,
+                &Some(self.plugin_configuration.clone()),
+                None,
+                None,
+            ) else {
+                return;
+            };
+            self.pending_open = Some(coordinates);
+            run_action(
+                actions::Action::LaunchOrFocusPlugin {
+                    plugin,
+                    should_float: true,
+                    move_to_focused_tab: true,
+                    should_open_in_place: false,
+                    close_replaced_pane: false,
+                    skip_cache: false,
+                    tab_id: Some(target_tab_id),
+                },
+                Self::context("open-deck"),
+            );
+            return;
+        }
         change_floating_panes_coordinates(vec![(pane_id, coordinates)]);
-        break_panes_to_tab_with_index(&[pane_id], target_tab, false);
+        if self.plugin_tab_position != Some(target_tab.position) {
+            break_panes_to_tab_with_index(&[pane_id], target_tab_id, false);
+        }
         show_self(true);
     }
 
@@ -1268,6 +1312,7 @@ impl ZellijPlugin for AgentDeck {
         self.model.show_inactive = configuration
             .get("show_inactive")
             .is_some_and(|value| parse_bool(value));
+        self.plugin_configuration = configuration;
         subscribe(&Self::subscribed_events());
         set_selectable(!self.compact_status);
         request_permission(&Self::required_permissions());
@@ -1316,8 +1361,24 @@ impl ZellijPlugin for AgentDeck {
                 set_timeout(3.0);
                 self.request_focus();
             }
-            Event::PaneUpdate(_) => {
+            Event::PaneUpdate(manifest) => {
+                self.plugin_tab_position = manifest.panes.iter().find_map(|(position, panes)| {
+                    panes
+                        .iter()
+                        .any(|pane| pane.is_plugin && Some(pane.id) == self.plugin_id)
+                        .then_some(*position)
+                });
                 self.request_focus();
+            }
+            Event::ActionComplete(_, pane_id, context)
+                if context.get("operation").is_some_and(|op| op == "open-deck") =>
+            {
+                if let (Some(coordinates), Some(pane_id)) = (self.pending_open.take(), pane_id) {
+                    if Some(pane_id) == self.plugin_id.map(PaneId::Plugin) {
+                        change_floating_panes_coordinates(vec![(pane_id, coordinates)]);
+                        show_self(true);
+                    }
+                }
             }
             Event::TabUpdate(_) | Event::SessionUpdate(_, _) => {
                 self.request_focus();

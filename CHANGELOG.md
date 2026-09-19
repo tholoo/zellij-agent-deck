@@ -38,6 +38,8 @@ is based on Keep a Changelog, and the project follows Semantic Versioning.
 
 ### Fixed
 
+- Open the deck on the invoking tab after tabs have been closed or reordered,
+  bypassing Zellij 0.45's mixed tab-ID/position pane mover when needed.
 - Keep read state consistent across decks when older hooks reuse a result
   generation, using the saved acknowledgement response instead of a permanent
   local override.
