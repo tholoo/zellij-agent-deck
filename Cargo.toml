@@ -2,7 +2,7 @@
 name = "zellij-agent-deck"
 version = "0.1.0"
 edition = "2021"
-description = "A cross-session inbox and control surface for Codex and OpenCode agents in Zellij"
+description = "A cross-session inbox and control surface for Codex, OpenCode, and Pi agents in Zellij"
 license = "MIT"
 readme = "README.md"
 keywords = ["codex", "zellij", "terminal", "agents"]

@@ -28,6 +28,13 @@ in
 
     opencode.enable = lib.mkEnableOption "OpenCode 2 TUI integration";
 
+    pi.enable = lib.mkEnableOption "Pi coding agent integration";
+    pi.agentDirectory = lib.mkOption {
+      type = lib.types.str;
+      default = ".pi/agent";
+      description = "Pi configuration directory, relative to the home directory (PI_CODING_AGENT_DIR).";
+    };
+
     resurrection = {
       retentionDays = lib.mkOption {
         type = lib.types.ints.unsigned;
@@ -58,6 +65,10 @@ in
 
     xdg.configFile."opencode/plugins/zellij-agent-deck" = lib.mkIf cfg.opencode.enable {
       source = "${cfg.package}/share/zellij-agent-deck/opencode";
+    };
+
+    home.file."${cfg.pi.agentDirectory}/extensions/zellij-agent-deck" = lib.mkIf cfg.pi.enable {
+      source = "${cfg.package}/share/zellij-agent-deck/pi";
     };
 
     home.sessionVariables = {

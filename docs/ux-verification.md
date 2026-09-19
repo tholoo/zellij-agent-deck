@@ -28,6 +28,18 @@ synthetic records and never starts Codex.
 On Zellij 0.45, moves after tab churn use the native plugin mover and check the
 restored dimensions; ordinary opens also check the first visible dimensions.
 
+Pi adapter fixtures run with `node --test tests/test_pi.mjs`. To check the real
+Pi extension loader and bridge, using isolated configuration and no model calls:
+
+```console
+ZELLIJ_AGENT_DECK_TEST_PI=pi \
+  python3 -m unittest discover -s tests -p test_pi_runtime.py -v
+```
+
+This resumes a synthetic session file, switches sessions through Pi's RPC mode,
+and verifies pane attachment and clean shutdown. Zellij notifications are stubbed;
+no existing desktop sessions are modified.
+
 Regression coverage includes:
 
 - Manual focus acknowledges a result without resolving its pending request.

@@ -14,6 +14,7 @@ struct AgentRecord {
     kind: String,
     codex_session_id: String,
     opencode_session_id: String,
+    pi_session_file: String,
     parent_key: String,
     zellij_session: String,
     pane_id: Option<u32>,
@@ -103,6 +104,7 @@ fn is_resumable(agent: &AgentRecord) -> bool {
         && match agent.kind.as_str() {
             "codex" => !agent.codex_session_id.is_empty(),
             "opencode" => !agent.opencode_session_id.is_empty(),
+            "pi" => !agent.pi_session_file.is_empty(),
             _ => false,
         }
 }
@@ -2181,6 +2183,23 @@ mod tests {
         assert_eq!(deck.matching_indices(), vec![0]);
         deck.model.set_filter(6);
         assert_eq!(deck.matching_indices(), vec![1]);
+    }
+
+    #[test]
+    fn pi_records_resume_only_with_a_persistent_session_file() {
+        let mut agent: AgentRecord = serde_json::from_str(
+            r#"{"kind":"pi","pi_session_file":"/tmp/exact session.jsonl","pane_id":0,"zellij_session":"dev"}"#,
+        ).unwrap();
+        assert!(!is_resumable(&agent));
+        agent.pane_id = None;
+        assert!(is_resumable(&agent));
+        let model = DeckModel {
+            filter: 6,
+            ..Default::default()
+        };
+        assert!(model.matches_filter(&agent));
+        agent.pi_session_file.clear();
+        assert!(!is_resumable(&agent));
     }
 
     #[test]

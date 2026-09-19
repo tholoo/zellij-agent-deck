@@ -1,0 +1,6 @@
+{
+  "name": "zellij-agent-deck-pi",
+  "private": true,
+  "type": "module",
+  "pi": { "extensions": ["./index.ts"] }
+}

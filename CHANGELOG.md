@@ -7,6 +7,9 @@ is based on Keep a Changelog, and the project follows Semantic Versioning.
 
 ### Added
 
+- Pi coding agent extension with session and tool lifecycle tracking, bounded
+  results, question-tool attention, exact session-file resume, Pi worktree
+  launches, and an optional Home Manager installation.
 - OpenCode 2 TUI integration with pane-scoped lifecycle tracking, approvals,
   questions, tool activity, bounded results, exact session resume, and OpenCode
   worktree launches. Includes a packaged plugin and optional Home Manager setup.

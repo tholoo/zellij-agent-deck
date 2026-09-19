@@ -30,6 +30,7 @@ CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 SAFE_BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,79}$")
 PREFIX_ENV = "ZELLIJ_AGENT_DECK_CODEX_PREFIX"
 OPENCODE_PREFIX_ENV = "ZELLIJ_AGENT_DECK_OPENCODE_PREFIX"
+PI_PREFIX_ENV = "ZELLIJ_AGENT_DECK_PI_PREFIX"
 PREFIX_ARG_LIMIT = 16
 PREFIX_ARG_LENGTH = 256
 RECONCILE_INTERVAL = 5
@@ -73,6 +74,9 @@ class RecordStore:
         "codex_session_id",
         "opencode_session_id",
         "opencode_attention_id",
+        "pi_session_id",
+        "pi_session_file",
+        "pi_attention_id",
         "parent_key",
         "zellij_session",
         "attachment_id",
@@ -480,13 +484,15 @@ def detect_launcher_prefix(
 
 
 def launcher_prefix(kind: str = "codex") -> list[str]:
-    configured = os.environ.get(OPENCODE_PREFIX_ENV if kind == "opencode" else PREFIX_ENV)
+    configured = os.environ.get(
+        {"opencode": OPENCODE_PREFIX_ENV, "pi": PI_PREFIX_ENV}.get(kind, PREFIX_ENV)
+    )
     if configured is not None:
         try:
             return normalize_launcher_prefix(json.loads(configured))
         except (TypeError, ValueError):
             return []
-    return [] if kind == "opencode" else detect_launcher_prefix()
+    return [] if kind in {"opencode", "pi"} else detect_launcher_prefix()
 
 
 def codex_command(record: dict[str, Any], *arguments: str) -> list[str]:
@@ -501,18 +507,20 @@ def codex_command(record: dict[str, Any], *arguments: str) -> list[str]:
 def agent_command(
     record: dict[str, Any], cwd: str, *, session_id: str = "", prompt: str = ""
 ) -> list[str]:
-    if record.get("kind") != "opencode":
+    kind = record.get("kind")
+    if kind not in {"opencode", "pi"}:
         arguments = ["resume", "-C", cwd, session_id] if session_id else ["-C", cwd]
         return codex_command(record, *arguments, *([prompt] if prompt else []))
     prefix = normalize_launcher_prefix(record.get("launcher_prefix"))
-    command = [*prefix, "opencode", cwd]
+    command = [*prefix, "pi"] if kind == "pi" else [*prefix, "opencode", cwd]
     if session_id:
         command.extend(["--session", session_id])
     if prompt:
-        command.extend(["--prompt", prompt])
+        command.extend(["--" if kind == "pi" else "--prompt", prompt])
     if prefix:
         encoded = json.dumps(prefix, ensure_ascii=False, separators=(",", ":"))
-        command = ["env", f"{OPENCODE_PREFIX_ENV}={encoded}", *command]
+        variable = PI_PREFIX_ENV if kind == "pi" else OPENCODE_PREFIX_ENV
+        command = ["env", f"{variable}={encoded}", *command]
     return command
 
 
@@ -531,15 +539,19 @@ def base_record(
         "schema": SCHEMA,
         "key": key,
         "kind": kind,
-        "codex_session_id": "" if kind == "opencode" else clean(payload.get("session_id"), 128),
+        "codex_session_id": ""
+        if kind in {"opencode", "pi"}
+        else clean(payload.get("session_id"), 128),
         "opencode_session_id": clean(payload.get("session_id"), 128) if kind == "opencode" else "",
+        "pi_session_id": clean(payload.get("session_id"), 128) if kind == "pi" else "",
+        "pi_session_file": "",
         "parent_key": "",
         "zellij_session": zellij_session,
         "pane_id": pane_id,
         "attachment_id": secrets.token_hex(16) if zellij_session and pane_id is not None else "",
         "launcher_prefix": launcher_prefix(kind),
         **metadata,
-        "title": "OpenCode session" if kind == "opencode" else "Codex session",
+        "title": {"opencode": "OpenCode session", "pi": "Pi session"}.get(kind, "Codex session"),
         "title_locked": False,
         "status": "idle",
         "unread": False,
@@ -843,6 +855,14 @@ def handle_event(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def handle_opencode_event(payload: dict[str, Any]) -> dict[str, Any] | None:
+    return handle_snapshot_event(payload, "opencode")
+
+
+def handle_pi_event(payload: dict[str, Any]) -> dict[str, Any] | None:
+    return handle_snapshot_event(payload, "pi")
+
+
+def handle_snapshot_event(payload: dict[str, Any], kind: str) -> dict[str, Any] | None:
     """Accept bounded TUI snapshots, with an attachment token fencing stale clients."""
     event = payload.get("event")
     session_id = clean(payload.get("session_id"), 128)
@@ -851,20 +871,25 @@ def handle_opencode_event(payload: dict[str, Any]) -> dict[str, Any] | None:
     pane = pane_number(os.environ.get("ZELLIJ_PANE_ID"))
     if (
         event not in {"attach", "update", "detach", "delete"}
-        or not re.fullmatch(r"ses[\w-]+", session_id)
+        or not re.fullmatch(
+            r"[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}"
+            if kind == "pi"
+            else r"ses[\w-]+",
+            session_id,
+        )
         or not re.fullmatch(r"[a-f0-9]{32}", attachment)
         or not session
         or pane is None
     ):
         return None
-    key = f"opencode:{session_id}"
+    key = f"{kind}:{session_id}"
     existing = RECORDS.get(key)
     if event != "attach" and existing is None:
         return None
     cwd = clean(payload.get("cwd") or (existing or {}).get("cwd") or os.getcwd(), 512)
     refresh = event == "attach" or cwd != (existing or {}).get("cwd")
     metadata = project_metadata(cwd, timeout=HOOK_GIT_TIMEOUT) if refresh else None
-    initial = base_record(payload, key, "opencode", metadata) if existing is None else None
+    initial = base_record(payload, key, kind, metadata) if existing is None else None
 
     def transition(record: dict[str, Any]) -> dict[str, Any]:
         if event != "attach" and (
@@ -876,18 +901,31 @@ def handle_opencode_event(payload: dict[str, Any]) -> dict[str, Any] | None:
         if event in {"detach", "delete"}:
             record.update(pane_id=None, attachment_id="", status="ended", unread=False, activity="")
             if event == "delete":
-                record.update(opencode_session_id="", dismissed=True)
+                record.update({f"{kind}_session_id": "", "dismissed": True})
+                if kind == "pi":
+                    record["pi_session_file"] = ""
         else:
             if event == "attach":
                 record.update(
                     zellij_session=session,
                     pane_id=pane,
                     attachment_id=attachment,
-                    launcher_prefix=launcher_prefix("opencode"),
+                    launcher_prefix=launcher_prefix(kind),
                     dismissed=False,
                 )
             if metadata is not None:
                 record.update(metadata)
+            if kind == "pi" and "session_file" in payload:
+                session_file = payload["session_file"]
+                record["pi_session_file"] = (
+                    session_file
+                    if isinstance(session_file, str)
+                    and len(session_file) <= 4096
+                    and "\x00" not in session_file
+                    and Path(session_file).is_absolute()
+                    and session_file.endswith(".jsonl")
+                    else ""
+                )
             title = clean(payload.get("title"), TITLE_LIMIT)
             if title and not record.get("title_locked"):
                 record["title"] = title
@@ -902,10 +940,10 @@ def handle_opencode_event(payload: dict[str, Any]) -> dict[str, Any] | None:
                 record["message"] = clean(payload.get("message"), MESSAGE_LIMIT)
                 attention_id = clean(payload.get("attention_id"), 128)
                 if status in {"needs_input", "done", "error"}:
-                    if attention_id and attention_id != record.get("opencode_attention_id"):
+                    if attention_id and attention_id != record.get(f"{kind}_attention_id"):
                         record["attention_seq"] = record.get("attention_seq", 0) + 1
                         record["unread"] = True
-                        record["opencode_attention_id"] = attention_id
+                        record[f"{kind}_attention_id"] = attention_id
                 else:
                     record["unread"] = False
         record["updated_at"] = now()
@@ -1126,10 +1164,14 @@ def do_park(record: dict[str, Any]) -> None:
 
 def do_resume(record: dict[str, Any], fallback_session: str = "") -> None:
     session_id = record.get(
-        "opencode_session_id" if record.get("kind") == "opencode" else "codex_session_id"
+        {"opencode": "opencode_session_id", "pi": "pi_session_file"}.get(
+            record.get("kind", ""), "codex_session_id"
+        )
     )
     if not session_id:
         raise SystemExit("agent has no resumable session id")
+    if record.get("kind") == "pi" and not Path(session_id).is_file():
+        raise SystemExit("Pi session file is missing; cannot resume this session")
     recorded_session = clean(record.get("zellij_session"), 128)
     fallback_session = clean(fallback_session or os.environ.get("ZELLIJ_SESSION_NAME"), 128)
     session = recorded_session or fallback_session
@@ -1229,7 +1271,7 @@ def worktrees(record: dict[str, Any]) -> list[dict[str, Any]]:
             if agent.get("project_root") == item["path"]
             and agent.get("pane_id") is not None
             and agent.get("zellij_session")
-            and agent.get("kind") in {"codex", "opencode"}
+            and agent.get("kind") in {"codex", "opencode", "pi"}
         ]
     return sorted(items, key=lambda item: (not item["current"], item["branch"], item["path"]))
 
@@ -1346,6 +1388,7 @@ def parser() -> argparse.ArgumentParser:
     sub = result.add_subparsers(dest="command", required=True)
     sub.add_parser("hook")
     sub.add_parser("opencode-hook")
+    sub.add_parser("pi-hook")
     listing = sub.add_parser("list")
     listing.add_argument("--refresh", action="store_true")
     listing.add_argument("--reconcile", action="store_true")
@@ -1385,7 +1428,7 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = parser().parse_args()
-    if args.command in {"hook", "opencode-hook"}:
+    if args.command in {"hook", "opencode-hook", "pi-hook"}:
         try:
             payload = json.load(sys.stdin)
         except (ValueError, TypeError):
@@ -1394,6 +1437,8 @@ def main() -> None:
             raise SystemExit("invalid hook JSON")
         if args.command == "opencode-hook":
             handle_opencode_event(payload)
+        elif args.command == "pi-hook":
+            handle_pi_event(payload)
         else:
             handle_event(payload)
     elif args.command == "list":

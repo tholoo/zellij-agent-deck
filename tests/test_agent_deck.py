@@ -54,6 +54,114 @@ class AgentDeckTest(unittest.TestCase):
             }
         )
 
+    def pi_event(self, event="update", **extra):
+        return deck.handle_pi_event(
+            {
+                "event": event,
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "session_file": str(Path(self.temp.name) / "exact session.jsonl"),
+                "attachment_id": "a" * 32,
+                "cwd": self.temp.name,
+                **extra,
+            }
+        )
+
+    def test_pi_lifecycle_attention_and_exact_session_metadata(self):
+        with patch.object(deck, "now", return_value=100):
+            record = self.pi_event("attach", status="working", title="Pi task")
+        self.assertEqual(record["kind"], "pi")
+        self.assertEqual(record["codex_session_id"], "")
+        self.assertEqual(record["opencode_session_id"], "")
+        self.assertTrue(record["pi_session_file"].endswith("exact session.jsonl"))
+        with patch.object(deck, "now", return_value=110):
+            tool = self.pi_event(status="working", activity="Using bash")
+        self.assertEqual(tool["status_since"], 100)
+        self.assertEqual(tool["activity_since"], 110)
+        question = self.pi_event(status="needs_input", attention_id="q1", message="Question")
+        self.assertTrue(question["unread"])
+        deck.mark_read(question["key"], question["attention_seq"], question["attachment_id"])
+        repeated = self.pi_event(status="needs_input", attention_id="q1")
+        self.assertFalse(repeated["unread"])
+        done = self.pi_event(status="done", attention_id="result1", message="Result\n" * 200)
+        self.assertEqual(len(done["message"]), deck.MESSAGE_LIMIT)
+        self.assertTrue(done["unread"])
+        deck.mutate(done["key"], title="Manual name", title_locked=True)
+        updated = self.pi_event(title="Native name", model="provider/model")
+        self.assertEqual(updated["title"], "Manual name")
+        self.assertEqual(updated["status"], "done")
+        self.assertEqual(updated["model"], "provider/model")
+        interrupted = self.pi_event(status="idle", message="Interrupted")
+        self.assertFalse(interrupted["unread"])
+        detached = self.pi_event("detach")
+        self.assertIsNone(detached["pane_id"])
+        self.assertEqual(detached["pi_session_file"], record["pi_session_file"])
+
+    def test_pi_stale_events_cannot_overwrite_new_attachment(self):
+        self.pi_event("attach")
+        with patch.dict(os.environ, {"ZELLIJ_PANE_ID": "8"}):
+            latest = self.pi_event("attach", attachment_id="b" * 32, status="working")
+        for event in ("update", "detach", "delete"):
+            stale = self.pi_event(event, status="error", session_file="/tmp/stale.jsonl")
+            self.assertEqual(
+                {key: value for key, value in stale.items() if key != "revision"},
+                {key: value for key, value in latest.items() if key != "revision"},
+            )
+
+    def test_pi_validates_identity_and_does_not_mix_with_codex(self):
+        self.assertIsNone(self.pi_event(status="done"))
+        for extra in ({"session_id": "bad"}, {"attachment_id": "bad"}, {"event": "unknown"}):
+            self.assertIsNone(self.pi_event(**{"event": "attach", **extra}))
+        with patch.dict(os.environ, {"ZELLIJ_SESSION_NAME": ""}):
+            self.assertIsNone(self.pi_event("attach"))
+        record = self.pi_event("attach", session_file="relative.jsonl")
+        self.assertEqual(record["pi_session_file"], "")
+        codex = self.event("SessionStart", session_id=record["pi_session_id"])
+        self.assertNotEqual(record["key"], codex["key"])
+        deleted = self.pi_event("delete")
+        self.assertEqual(deleted["pi_session_file"], "")
+        self.assertEqual(deleted["pi_session_id"], "")
+        self.assertTrue(deleted["dismissed"])
+
+    def test_pi_resume_and_worktree_launch_preserve_application_and_prefix(self):
+        with patch.dict(os.environ, {deck.PI_PREFIX_ENV: '["wrapper", "--quiet"]'}):
+            record = self.pi_event("attach")
+        Path(record["pi_session_file"]).write_text("{}\n")
+        expected_prefix = [
+            "env",
+            'ZELLIJ_AGENT_DECK_PI_PREFIX=["wrapper","--quiet"]',
+            "wrapper",
+            "--quiet",
+            "pi",
+        ]
+        with (
+            patch.object(deck.subprocess, "run") as run,
+            patch.object(deck, "zellij_sessions", return_value={"dev": True}),
+        ):
+            deck.do_resume(record)
+        command = run.call_args.args[0]
+        self.assertEqual(
+            command[command.index("--") + 1 :],
+            expected_prefix + ["--session", record["pi_session_file"]],
+        )
+        self.assertEqual(command[command.index("--cwd") + 1], self.temp.name)
+        with patch.object(deck.subprocess, "run") as run:
+            deck.launch_worktree(record, "/tmp/new worktree", "feature", prompt="--literal prompt")
+        command = run.call_args.args[0]
+        self.assertEqual(
+            command[command.index("--") + 1 :], expected_prefix + ["--", "--literal prompt"]
+        )
+        self.assertEqual(command[command.index("--cwd") + 1], "/tmp/new worktree")
+
+    def test_pi_cannot_resume_ephemeral_or_missing_session_file(self):
+        record = self.pi_event("attach", session_file="")
+        with patch.object(deck.subprocess, "run") as run:
+            with self.assertRaisesRegex(SystemExit, "no resumable session"):
+                deck.do_resume(record)
+            record = self.pi_event(session_file="/tmp/nonexistent-deck-pi-session.jsonl")
+            with self.assertRaisesRegex(SystemExit, "session file is missing"):
+                deck.do_resume(record)
+            run.assert_not_called()
+
     def test_opencode_lifecycle_preserves_titles_attention_and_ages(self):
         with patch.object(deck, "now", return_value=100):
             first = self.opencode_event("attach", title="Fix OpenCode support", status="working")
@@ -716,7 +824,11 @@ class AgentDeckTest(unittest.TestCase):
         self.assertEqual(entries[0]["agents"], [record["key"]])
         with patch.dict(os.environ, {"ZELLIJ_PANE_ID": "8"}):
             opencode = self.opencode_event("attach", cwd=str(other))
-        self.assertEqual(set(deck.worktrees(record)[0]["agents"]), {record["key"], opencode["key"]})
+        with patch.dict(os.environ, {"ZELLIJ_PANE_ID": "9"}):
+            pi = self.pi_event("attach", cwd=str(other))
+        self.assertEqual(
+            set(deck.worktrees(record)[0]["agents"]), {record["key"], opencode["key"], pi["key"]}
+        )
         with self.assertRaisesRegex(SystemExit, "live agent"):
             deck.open_worktree(record, str(other))
         with patch.object(deck, "launch_worktree") as launch:

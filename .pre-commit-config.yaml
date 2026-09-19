@@ -79,3 +79,10 @@ repos:
         language: system
         pass_filenames: false
         types: [nix]
+
+      - id: pi-tests
+        name: Pi extension tests
+        entry: node --test tests/test_pi.mjs
+        language: system
+        pass_filenames: false
+        always_run: true

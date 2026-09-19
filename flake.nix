@@ -1,5 +1,5 @@
 {
-  description = "Floating cross-session Codex and OpenCode navigator for Zellij";
+  description = "Floating cross-session Codex, OpenCode, and Pi navigator for Zellij";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -110,6 +110,16 @@
               }
               ''
                 node --test ${source}/tests/test_opencode.mjs
+                touch $out
+              '';
+
+          pi =
+            pkgs.runCommand "zellij-agent-deck-pi-checks"
+              {
+                nativeBuildInputs = [ pkgs.nodejs ];
+              }
+              ''
+                node --test ${source}/tests/test_pi.mjs
                 touch $out
               '';
 

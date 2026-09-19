@@ -1,7 +1,7 @@
 # Zellij Agent Deck
 
-A floating, cross-session inbox and control surface for Codex and OpenCode agents.
-Codex lifecycle hooks and an OpenCode TUI plugin send bounded status records to a
+A floating, cross-session inbox and control surface for Codex, OpenCode, and Pi agents.
+Codex lifecycle hooks, an OpenCode TUI plugin, and a Pi extension send bounded status records to a
 background Zellij plugin. The plugin highlights panes that need attention and
 opens as a floating pane on demand.
 
@@ -9,7 +9,7 @@ The project is currently pre-release; use the pinned `main` branch until the
 first versioned release is tagged.
 
 > [!IMPORTANT]
-> This project is an independent integration for Codex, OpenCode, and Zellij.
+> This project is an independent integration for Codex, OpenCode, Pi, and Zellij.
 > It is not affiliated with or endorsed by their developers.
 
 ![Zellij Agent Deck running with synthetic agent sessions](docs/assets/agent-deck-current.png)
@@ -20,7 +20,8 @@ _Actual plugin UI with fictional sessions and task data._
 
 - Linux
 - Zellij 0.45.0
-- Codex with lifecycle hooks enabled, or OpenCode 2.0 with the TUI plugin below
+- Codex with lifecycle hooks enabled, OpenCode 2.0, or Pi coding agent 0.85.1+
+  with the corresponding integration below
 - Nix with flakes enabled (recommended build and installation path)
 
 The host bridge optionally uses `git`, `gh`, and `ss` to enrich agent records.
@@ -53,6 +54,7 @@ sets resurrection retention options:
   imports = [ inputs.zellij-agent-deck.homeManagerModules.default ];
   programs.zellij-agent-deck.enable = true;
   programs.zellij-agent-deck.opencode.enable = true; # Optional OpenCode 2 integration
+  programs.zellij-agent-deck.pi.enable = true; # Optional Pi coding agent integration
 }
 ```
 
@@ -151,6 +153,52 @@ ZELLIJ_AGENT_DECK_OPENCODE_PREFIX='["command-wrapper","--quiet"]' \
 
 OpenCode resumes and worktree launches preserve this prefix. OpenCode wrapper
 prefixes are not inferred from process ancestry.
+
+## Configure Pi
+
+For the **Pi coding agent** (tested with 0.85.1), copy the bundled extension into
+Pi's extension directory:
+
+```console
+mkdir -p ~/.pi/agent/extensions/zellij-agent-deck
+cp ~/.nix-profile/share/zellij-agent-deck/pi/{index.ts,extension.js,package.json} \
+  ~/.pi/agent/extensions/zellij-agent-deck/
+```
+
+For a checkout, use the files in [`pi/`](pi/) instead. If `PI_CODING_AGENT_DIR` is
+set, use its `extensions/` directory. Run `/reload` in Pi or restart it.
+The extension needs the updated `zellij-agent-deck` helper on `PATH`; alternatively
+set `ZELLIJ_AGENT_DECK_COMMAND` to its absolute path. It does nothing outside Zellij.
+
+Home Manager's `programs.zellij-agent-deck.pi.enable` installs the extension.
+For a custom config location, set `programs.zellij-agent-deck.pi.agentDirectory`
+to the corresponding path relative to your home directory.
+
+The integration uses Pi's [extension lifecycle API](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md).
+It tracks session names, models, tool activity, completion, errors, interruption,
+and bounded assistant result excerpts. Session switches, forks, reloads, and exit
+detach the previous pane attachment. Known question tools (`ask_user_question`,
+`ask_question`, `question`, and `questionnaire`) appear as needing input while
+they run. Other extensions' custom approval dialogs are not exposed by this
+lifecycle API and should be answered inside Pi. Tool arguments, tool output,
+and reasoning content are not sent to the deck.
+
+`R` resumes with `pi --session <exact-session-file>`, including files in custom
+session directories. Missing files are rejected rather than starting a new
+conversation; `--no-session` sessions cannot be resumed. Pi only persists a new
+session after it has assistant output, so an unused session may have no file yet.
+Selecting a Pi agent in the worktree picker starts Pi in that checkout. Replies
+and parking use the same pane controls as other agents. Exact Zellij command
+resurrection remains Codex-specific.
+
+For a launcher wrapper, record its prefix explicitly:
+
+```console
+ZELLIJ_AGENT_DECK_PI_PREFIX='["command-wrapper","--quiet"]' command-wrapper --quiet pi
+```
+
+Pi resumes and worktree launches preserve this prefix. Wrapper prefixes are not
+inferred from process ancestry.
 
 ## Privacy and local state
 

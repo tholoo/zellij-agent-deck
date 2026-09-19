@@ -157,20 +157,21 @@ fn summary(deck: &AgentDeck) -> String {
     format!("{needs} need you · {working} working · {results} new results")
 }
 
+fn agent_name(agent: &AgentRecord) -> &'static str {
+    match agent.kind.as_str() {
+        "opencode" => "OpenCode",
+        "pi" => "Pi",
+        _ => "Codex",
+    }
+}
+
 fn details(agent: &AgentRecord, now: u64) -> Vec<String> {
     let mut lines = vec![
         agent.title.clone(),
         format!("{} · {}", status(agent), age(now, agent.status_since)),
         branch_label(agent),
         format!("Worktree  {}", agent.project_root),
-        format!(
-            "Agent  {}",
-            if agent.kind == "opencode" {
-                "OpenCode"
-            } else {
-                "Codex"
-            }
-        ),
+        format!("Agent  {}", agent_name(agent)),
     ];
     if !agent.message.is_empty() {
         lines.insert(2, agent.message.clone());
@@ -362,15 +363,7 @@ fn worktree_screen(deck: &AgentDeck, rows: usize, cols: usize) -> Screen {
         return screen;
     }
     let mut lines = Vec::new();
-    let agent_name = if deck
-        .action_target
-        .as_ref()
-        .is_some_and(|agent| agent.kind == "opencode")
-    {
-        "OpenCode"
-    } else {
-        "Codex"
-    };
+    let agent_name = deck.action_target.as_ref().map_or("Codex", agent_name);
     if let Some(plan) = &deck.worktree_plan {
         lines.push(if plan.existing {
             format!("Start a new {agent_name} session")
@@ -799,6 +792,29 @@ pub(super) fn screen(deck: &mut AgentDeck, rows: usize, cols: usize, now: u64) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pi_details_and_worktree_confirmation_identify_the_agent() {
+        let agent = AgentRecord {
+            kind: "pi".into(),
+            ..Default::default()
+        };
+        assert!(details(&agent, 100).contains(&"Agent  Pi".to_owned()));
+        let mut deck = AgentDeck {
+            mode: InputMode::ConfirmWorktree,
+            action_target: Some(agent),
+            worktree_plan: Some(crate::WorktreePlan {
+                existing: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let output = screen(&mut deck, 24, 100, 100);
+        assert!(output
+            .lines
+            .iter()
+            .any(|line| line.text.contains("new Pi session")));
+    }
 
     #[test]
     fn layout_fits_terminal_cells_and_clicks_respect_multiline_rows() {
