@@ -38,6 +38,9 @@ is based on Keep a Changelog, and the project follows Semantic Versioning.
 
 ### Fixed
 
+- Keep read state consistent across decks when older hooks reuse a result
+  generation, using the saved acknowledgement response instead of a permanent
+  local override.
 - Return interrupted Codex turns to idle and clear stale activity and attention
   through the `Interrupt` lifecycle hook.
 - Preserve selected sessions and action targets when incoming updates reorder rows.

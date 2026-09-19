@@ -126,6 +126,19 @@ class ZellijRuntimeTest(unittest.TestCase):
                     lambda: not json.loads(self.record_path.read_text())["unread"],
                     "successful read retry",
                 )
+                # A still-running older hook can publish another completion
+                # without advancing the newer generation/revision fields.
+                # The owning deck must observe it and save the read again,
+                # allowing decks in other sessions to see the same state.
+                time.sleep(0.2)
+                legacy_result = json.loads(self.record_path.read_text())
+                legacy_result["unread"] = True
+                legacy_result["updated_at"] += 1
+                self.record_path.write_text(json.dumps(legacy_result))
+                self.wait_for(
+                    lambda: not json.loads(self.record_path.read_text())["unread"],
+                    "shared read state after a legacy completion",
+                )
                 # Let its callback arrive before opening the UI; the old plugin
                 # leaves a warning visible even after this successful retry.
                 time.sleep(0.2)
